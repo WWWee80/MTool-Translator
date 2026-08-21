@@ -18,6 +18,12 @@ import os
 import datetime
 import threading
 import tkinter as tk
+
+# ==================== 版本与更新 ====================
+VERSION = "1.0.0"
+# GitHub 仓库地址（推送到 GitHub 后改成你的 用户名/仓库名）
+GITHUB_REPO = "WWWee80/MTool-Translator"
+GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -519,7 +525,7 @@ LANGUAGES = [
 class TranslatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("MTool翻译工具")
+        self.root.title(f"MTool翻译工具 v{VERSION}")
         self.root.geometry("880x760")
         self.root.minsize(780, 640)
 
@@ -1443,6 +1449,30 @@ class TranslatorApp:
             messagebox.showerror("错误", f"统计失败: {e}")
 
 
+def check_for_updates(root):
+    """后台检查GitHub Release是否有新版本，有则提示"""
+    if GITHUB_REPO.startswith("your-name/"):
+        return  # 未配置仓库，跳过
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(GITHUB_API, headers={'User-Agent': 'MTool-Translator'})
+        resp = urllib.request.urlopen(req, context=ctx, timeout=10)
+        data = json.loads(resp.read().decode('utf-8'))
+        latest = data.get('tag_name', '').lstrip('v')
+        if latest and latest != VERSION:
+            download_url = data.get('html_url', '')
+            release_notes = data.get('body', '')[:500]
+            msg = f"发现新版本 v{latest}（当前 v{VERSION}）\n\n"
+            if release_notes:
+                msg += f"更新说明:\n{release_notes}\n\n"
+            msg += f"下载地址: {download_url}"
+            root.after(0, lambda: messagebox.showinfo("发现新版本", msg))
+    except Exception:
+        pass  # 检查失败静默跳过，不影响使用
+
+
 def main():
     # 尝试启用拖拽支持
     try:
@@ -1459,6 +1489,8 @@ def main():
     app = TranslatorApp(root)
     if dnd_available:
         app._setup_dnd()
+    # 后台检查更新（不阻塞启动）
+    threading.Thread(target=check_for_updates, args=(root,), daemon=True).start()
     root.mainloop()
 
 
