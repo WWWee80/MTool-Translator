@@ -23,6 +23,12 @@ echo [2/3] 正在打包（首次较慢，请耐心等待）...
   --collect-data tkinterdnd2 ^
   --hidden-import tkinterdnd2 ^
   --hidden-import tkinterdnd2.tkdnd ^
+  --hidden-import pygtrans ^
+  --hidden-import pygtrans.Translate ^
+  --hidden-import pygtrans.TranslateResponse ^
+  --hidden-import pygtrans.DetectResponse ^
+  --hidden-import pygtrans.Null ^
+  --collect-data pygtrans ^
   "MTool翻译工具.py"
 
 if %errorlevel% neq 0 (
