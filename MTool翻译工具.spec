@@ -3,6 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 datas = []
 datas += collect_data_files('tkinterdnd2')
+datas += collect_data_files('pygtrans')
 
 
 a = Analysis(
@@ -10,7 +11,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['tkinterdnd2', 'tkinterdnd2.tkdnd'],
+    hiddenimports=['tkinterdnd2', 'tkinterdnd2.tkdnd', 'pygtrans', 'pygtrans.Translate', 'pygtrans.TranslateResponse', 'pygtrans.DetectResponse', 'pygtrans.Null'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
