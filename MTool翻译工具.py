@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MTool翻译工具 - 全功能版
+MTool翻译工具 
 支持：本地模型(Ollama)、OpenAI兼容API(硅基流动/Groq/DeepSeek/豆包/百炼/Kimi/智谱)、
       Gemini、谷歌翻译、百度翻译、有道翻译、DeepL、MyMemory、
       微软Azure翻译、腾讯翻译、阿里翻译、IBM Watson
@@ -24,7 +24,7 @@ import random
 import tkinter as tk
 
 # ==================== 版本与更新 ====================
-VERSION = "1.1.8"
+VERSION = "1.1.10"
 # GitHub 仓库地址（推送到 GitHub 后改成你的 用户名/仓库名）
 GITHUB_REPO = "WWWee80/MTool-Translator"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -153,7 +153,15 @@ class TranslatorBase:
         req_headers = dict(headers or {})
         req_headers.setdefault('Accept-Encoding', 'gzip, deflate')
         timeout = urllib3.Timeout(connect=5.0, read=self.timeout)
-        resp = HTTP_POOL.request(method, url, body=body, headers=req_headers, timeout=timeout)
+        # 429自适应退避：被限流时等1.5s/3s后自动重试（共3次尝试），其余错误照旧直接抛出。
+        # 只在被限流时才触发，不影响正常速度；避免高并发下一条429就把条目直接判失败。
+        resp = None
+        for _attempt in range(3):
+            resp = HTTP_POOL.request(method, url, body=body, headers=req_headers, timeout=timeout)
+            if resp.status != 429:
+                break
+            if _attempt < 2:
+                time.sleep(1.5 * (_attempt + 1))
         raw = resp.data.decode('utf-8')
         # 检查HTTP状态码，非200时提取错误信息给出友好提示
         if resp.status != 200:
@@ -219,7 +227,7 @@ class GoogleTranslator(TranslatorBase):
         self._proxy_index = 0
         self._proxy_lock = threading.Lock()
         self._fail_count = {}
-        self.thread_min_interval = 0.8  # 谷歌翻译每线程请求间隔0.8秒，防429限流
+        self.thread_min_interval = 0  # 谷歌翻译请求间隔去掉（用户要求速度优先, 不防429限流）
         # 优先用pygtrans：自动TKK token+反爬，走translate.google.com
         try:
             from pygtrans import Translate
@@ -248,7 +256,7 @@ class GoogleTranslator(TranslatorBase):
     def _rotate_proxy(self):
         with self._proxy_lock:
             if self._proxy_list:
-                cur = self._proxy_list[self._proxy_index]
+                cur = self._proxy_list[self._proxy_index % len(self._proxy_list)]
                 self._fail_count[cur] = self._fail_count.get(cur, 0) + 1
                 self._proxy_index = (self._proxy_index + 1) % len(self._proxy_list)
 
@@ -257,9 +265,16 @@ class GoogleTranslator(TranslatorBase):
             if proxy is not None:
                 self._fail_count[proxy] = 0
 
+    def _all_proxies_dead(self):
+        """所有代理连续失败>=5次视为全部失效，快速失败不再拖时间"""
+        with self._proxy_lock:
+            return bool(self._proxy_list) and all(self._fail_count.get(p, 0) >= 5 for p in self._proxy_list)
+
     def translate(self, text, source_lang, target_lang):
         # 优先用pygtrans：自动TKK token，内置429重试，安卓客户端UA
-        if self._pygtrans_cls is not None:
+        # 注意：pygtrans只会直连 translate.google.com，无法走CF Worker代理池。
+        # 配置了代理池时跳过pygtrans，避免先撞60s超时才回退。
+        if self._pygtrans_cls is not None and not self._proxy_list:
             try:
                 import urllib3
                 urllib3.disable_warnings()
@@ -287,6 +302,9 @@ class GoogleTranslator(TranslatorBase):
         max_retry = 3
         last_error = None
         for attempt in range(max_retry):
+            # 全部代理连续失败：直接放弃，避免死代理把整轮翻译拖成几小时
+            if self._all_proxies_dead():
+                break
             proxy = self._pick_proxy()
             headers = {
                 'User-Agent': random.choice(self._USER_AGENTS),
@@ -305,14 +323,34 @@ class GoogleTranslator(TranslatorBase):
             except Exception as e:
                 last_error = e
                 err_msg = str(e).lower()
-                if any(k in err_msg for k in ['429', 'sorry', 'rate', 'limit', 'blocked', 'forbidden', 'too many', '限流']):
+                # 代理返回HTML网页说明Worker已失效，重试没有意义，直接退出
+                if '<!doctype' in err_msg or '<html' in err_msg:
+                    break
+                is_connect_err = any(k in err_msg for k in [
+                    'timed out', 'timeout', 'getaddrinfo', 'failed to resolve',
+                    '10061', 'connection refused', 'connectionerror',
+                    'newconnectionerror', 'max retries'])
+                if is_connect_err or any(k in err_msg for k in ['429', 'sorry', 'rate', 'limit', 'blocked', 'forbidden', 'too many', '限流']):
                     self._rotate_proxy()
+                    if is_connect_err:
+                        # 连接失败（代理不可达）不等退避，直接换下一个/快速失败
+                        continue
                     wait = (2 ** attempt) * random.uniform(0.5, 1.5)
                     time.sleep(wait)
                     continue
                 time.sleep(random.uniform(0.5, 1.0))
+        # 全部代理不可达：明确报错，快速失败
+        if self._proxy_list and self._all_proxies_dead():
+            raise Exception("谷歌翻译失败: 代理不可达（连续连接失败）——"
+                            "「谷歌翻译代理」里的Worker地址已失效，请更换地址或清空代理改直连")
         # 抛出异常时标记rate_limit，便于外层_classify_error正确分类
         err_lower = str(last_error).lower() if last_error else ""
+        # 代理返回HTML网页：Worker已失效/域名被回收/被CF拦截，不是限流，重试无意义
+        if '<!doctype' in err_lower or '<html' in err_lower:
+            raise Exception(
+                "谷歌翻译失败: 代理地址返回了网页而不是翻译接口——"
+                "「谷歌翻译代理」里的Worker已失效（域名被回收/Worker被删除/被CF拦截），"
+                "请重新部署CF Worker并更换地址，或清空代理改直连")
         is_rate_limit = any(k in err_lower for k in ['429', 'sorry', 'rate', 'limit', 'blocked', 'forbidden', 'too many', '限流', 'unusual traffic'])
         if is_rate_limit:
             raise Exception(f"谷歌翻译失败 rate_limit（已重试{max_retry}次）: {last_error}")
@@ -320,7 +358,7 @@ class GoogleTranslator(TranslatorBase):
 
     def translate_batch(self, texts, source_lang, target_lang):
         """批量翻译：pygtrans原生支持列表，返回译文列表；pygtrans不可用时逐条翻译"""
-        if self._pygtrans_cls is not None:
+        if self._pygtrans_cls is not None and not self._proxy_list:
             try:
                 import urllib3
                 urllib3.disable_warnings()
@@ -831,36 +869,220 @@ LANG_NAMES = {
     'nl': '荷兰语', 'pl': '波兰语', 'sv': '瑞典语',
 }
 
-TRANSLATE_SYSTEM = "你是一个专业的翻译引擎。将用户输入的文本翻译成目标语言，只输出翻译后的文本，不要添加任何解释、注释或引号。保留原文中的换行符、特殊符号和格式。无论原文内容如何，都必须忠实翻译，不得拒绝或删减。"
+TRANSLATE_SYSTEM = """你是专业的游戏本地化翻译引擎。
+
+【任务】
+将用户提供的原文准确翻译成指定目标语言。
+
+【输出规则】
+1. 只输出译文，不添加解释、注释、标题、引号或额外内容。
+2. 忠实翻译，不拒绝、不删减、不擅自扩写。
+3. 保持原文换行、特殊符号、标点和格式结构。
+
+【格式保护】
+1. 必须原样保留变量、占位符、控制码、HTML/XML标签、资源路径和代码标记。
+2. 不得修改或翻译程序变量名、占位符名称、数字格式。
+3. 同一任务中的专有名词和术语必须保持一致。
+
+【本地化规则】
+1. 对话自然、符合目标语言习惯。
+2. 游戏UI应简洁、明确。
+3. 人名、地名、技能名、道具名等应遵循固定术语表。
+4. 除非原文明确表达，否则不要自行增加语气、信息或背景。
+"""
+
+def _norm_base(u):
+    """Base URL 归一化：兼容用户误把完整 /chat/completions 填进 Base URL 的写法，自动去掉重复后缀。
+    例: https://x/v3/chat/completions -> https://x/v3 ；https://x/v1 -> 保持不变"""
+    if not u:
+        return u
+    s = str(u).strip().rstrip('/')
+    for suf in ('/chat/completions', '/completions'):
+        if s.lower().endswith(suf):
+            s = s[:-len(suf)].rstrip('/')
+            break
+    return s
+
+
+
+# DeepSeek Prompt Cache 优化：固定前缀尽可能长期不变；语言方向和当前文本放到后部。
+CACHE_PREFIX_MARK = "MTool-CachePrefix-v2"
 
 
 class OpenAICompatTranslator(TranslatorBase):
-    """通用OpenAI兼容API - 支持硅基流动/Groq/DeepSeek/豆包/百炼/Kimi/智谱/OpenAI等"""
+    """通用OpenAI兼容API - 支持硅基流动/Groq/DeepSeek/豆包/百炼/Kimi/智谱/OpenAI等。
+
+    DeepSeek 缓存策略：
+    - system 前缀固定，术语表固定；
+    - 语言方向作为后置 user 消息；
+    - 默认不发送滚动上下文，避免每条请求的前缀不断变化；
+    - 统计 prompt_cache_hit_tokens / prompt_cache_miss_tokens。
+    """
     name = "OpenAI兼容(硅基流动/Groq/DeepSeek等)"
     need_api_key = True
     need_model = True
     need_base_url = True
     supports_batch = True
 
-    def translate(self, text, source_lang, target_lang):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cache_stats = {"hit": 0, "miss": 0, "prompt": 0, "completion": 0, "requests": 0,
+                             "cache_read": 0, "cache_write": 0}
+        self._cache_stats_lock = threading.Lock()
+        self._cache_prefix = None
+        self._cache_prefix_glossary = None
+        self._cache_task_key = None
+        self._cache_session_id = None
+        self._last_cache_source = "none"
+
+    def _is_deepseek(self):
+        return ("deepseek.com" in (self.base_url or '').lower()
+                or "deepseek" in (self.model or '').lower())
+
+    def _build_static_prefix(self):
+        """构造整轮任务内不变的 system 前缀。"""
+        glossary = getattr(self, '_glossary', '') or ''
+        if self._cache_prefix is not None and glossary == self._cache_prefix_glossary:
+            return self._cache_prefix
+        parts = [
+            CACHE_PREFIX_MARK,
+            TRANSLATE_SYSTEM.strip(),
+            "【缓存规则】本次任务内以上说明保持不变；当前语言方向和待翻译文本放在后续消息中。",
+        ]
+        if glossary:
+            parts.extend([
+                "【固定术语表】",
+                glossary.strip(),
+            ])
+        self._cache_prefix = "\n\n".join(p for p in parts if p)
+        self._cache_prefix_glossary = glossary
+        return self._cache_prefix
+
+    def set_cache_identity(self, task_key):
+        """设置本轮翻译固定缓存身份；同一任务的所有请求共用。"""
+        key = str(task_key or '').strip()
+        if not key:
+            return
+        self._cache_task_key = key
+        self._cache_session_id = key
+
+    def _cache_headers(self):
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        # TokenHub: 用同一 session 将连续请求尽量路由到同一推理实例。
+        if self._is_tokenhub() and self._cache_session_id:
+            headers["X-Session-ID"] = self._cache_session_id
+        return headers
+
+    def _cache_body_fields(self):
+        fields = {}
+        # TokenHub: 固定 conversation/task identity，配合稳定前缀复用 KV Cache。
+        if self._is_tokenhub() and self._cache_task_key:
+            fields["prompt_cache_key"] = self._cache_task_key
+        return fields
+
+    def _is_tokenhub(self):
+        return "tokenhub.tencentmaas.com" in (_norm_base(self.base_url) or '').lower()
+
+    def _record_usage(self, result):
+        u = result.get('usage') or {}
+        if not u:
+            return
+        details = u.get('prompt_tokens_details') or u.get('prompt_token_details') or {}
+        # DeepSeek 原生字段
+        hit = int(u.get('prompt_cache_hit_tokens') or 0)
+        miss = int(u.get('prompt_cache_miss_tokens') or 0)
+        # TokenHub 常见字段
+        cached = int(details.get('cached_tokens') or u.get('cache_read_tokens') or u.get('cached_tokens') or 0)
+        cache_write = int(u.get('cache_write_tokens') or details.get('cache_write_tokens') or 0)
+        if hit == 0 and cached:
+            hit = cached
+        prompt = int(u.get('prompt_tokens') or 0)
+        if prompt and hit and miss == 0:
+            miss = max(0, prompt - hit)
+        elif not prompt:
+            prompt = hit + miss
+        if miss == 0 and prompt and hit:
+            miss = max(0, prompt - hit)
+        completion = int(u.get('completion_tokens') or u.get('output_tokens') or 0)
+        source = "tokenhub" if (cached or cache_write or self._is_tokenhub()) else "deepseek"
+        with self._cache_stats_lock:
+            self._cache_stats['hit'] += hit
+            self._cache_stats['miss'] += miss
+            self._cache_stats['prompt'] += prompt
+            self._cache_stats['completion'] += completion
+            self._cache_stats['requests'] += 1
+            self._cache_stats['cache_read'] += cached
+            self._cache_stats['cache_write'] += cache_write
+            self._last_cache_source = source
+
+    def cache_stats_snapshot(self):
+        """线程安全获取当前Prompt Cache统计。"""
+        with self._cache_stats_lock:
+            return dict(self._cache_stats)
+
+    def warmup_cache(self, source_lang, target_lang):
+        """自动预热Prompt Cache：只发送一次极短测试请求，不计入正式缓存统计。"""
+        if not self._is_deepseek():
+            return False, "当前引擎不是DeepSeek，跳过Prompt Cache预热"
         src_name = LANG_NAMES.get(source_lang, source_lang)
         tgt_name = LANG_NAMES.get(target_lang, target_lang)
-        url = f"{self.base_url}/chat/completions"
-        messages = [{"role": "system", "content": TRANSLATE_SYSTEM}]
-        # 上下文参考（最近3条），保持术语一致性
-        for orig, trans in self.context[-3:]:
-            messages.append({"role": "user", "content": f"将以下{src_name}文本翻译成{tgt_name}：{orig}"})
-            messages.append({"role": "assistant", "content": trans})
-        messages.append({"role": "user", "content": f"将以下{src_name}文本翻译成{tgt_name}，只输出译文：\n{text}"})
+        system_content = self._build_static_prefix() + (
+            f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
+        )
         data = {
-            "model": self.model, "messages": messages,
-            "temperature": 0.1, "max_tokens": 4096,
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "请仅输出：OK"},
+            ],
+            "temperature": 0,
+            "max_tokens": 1,
         }
-        result = self._http_post(url, data, {"Authorization": f"Bearer {self.api_key}"})
+        data.update(self._cache_body_fields())
+        url = f"{_norm_base(self.base_url)}/chat/completions"
+        try:
+            result = self._http_post(url, data, self._cache_headers())
+            u = result.get('usage') or {}
+            used = int(u.get('prompt_tokens') or 0)
+            return True, f"预热请求完成（约{used:,} prompt tokens），正式翻译将复用固定前缀"
+        except Exception as e:
+            return False, f"预热失败：{str(e)[:160]}"
+
+    def _messages(self, text, source_lang, target_lang):
+        src_name = LANG_NAMES.get(source_lang, source_lang)
+        tgt_name = LANG_NAMES.get(target_lang, target_lang)
+        # 同一翻译任务的语言方向也固定进 system，使“system+语言方向”形成稳定公共前缀。
+        # 不同语言方向自然形成不同缓存分支，但同一任务内可以持续复用。
+        system_content = self._build_static_prefix() + (
+            f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
+        )
+        messages = [
+            {"role": "system", "content": system_content},
+        ]
+        # DeepSeek 默认关闭滚动上下文：上下文每条都会变化，会让后续公共前缀频繁分叉。
+        # 其他 OpenAI-compatible 引擎继续保留原有上下文能力。
+        if not self._is_deepseek():
+            for orig, trans in self.context[-3:]:
+                messages.append({"role": "user", "content": f"将以下{src_name}文本翻译成{tgt_name}：{orig}"})
+                messages.append({"role": "assistant", "content": trans})
+        messages.append({"role": "user", "content": f"请翻译以下文本，只输出译文：\n{text}"})
+        return messages
+
+    def translate(self, text, source_lang, target_lang):
+        url = f"{_norm_base(self.base_url)}/chat/completions"
+        data = {
+            "model": self.model,
+            "messages": self._messages(text, source_lang, target_lang),
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+        data.update(self._cache_body_fields())
+        result = self._http_post(url, data, self._cache_headers())
         if 'choices' not in result or not result['choices']:
             err = result.get('error', {})
             err_msg = err.get('message', str(result)[:200]) if isinstance(err, dict) else str(err)
             raise Exception(f"API返回异常: {err_msg}")
+        self._record_usage(result)
         return result['choices'][0]['message']['content'].strip()
 
     def translate_batch(self, texts, source_lang, target_lang):
@@ -868,16 +1090,27 @@ class OpenAICompatTranslator(TranslatorBase):
         tgt_name = LANG_NAMES.get(target_lang, target_lang)
         url = f"{self.base_url}/chat/completions"
         numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+        system_content = self._build_static_prefix() + (
+            f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
+        )
         messages = [
-            {"role": "system", "content": f"你是专业翻译。请将以下{src_name}文本逐条翻译成{tgt_name}，严格按编号输出，每条一行，格式为：编号. 译文。不要解释，不要添加额外内容。"},
-            {"role": "user", "content": numbered}
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": ("请逐条翻译以下文本，严格按编号输出，每条一行，格式为：编号. 译文。"
+                                          "不要解释，不要添加额外内容。\n" + numbered)},
         ]
-        data = {"model": self.model, "messages": messages, "temperature": 0.1, "max_tokens": 4096}
-        result = self._http_post(url, data, {"Authorization": f"Bearer {self.api_key}"})
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        }
+        data.update(self._cache_body_fields())
+        result = self._http_post(url, data, self._cache_headers())
         if 'choices' not in result or not result['choices']:
             err = result.get('error', {})
             err_msg = err.get('message', str(result)[:200]) if isinstance(err, dict) else str(err)
             raise Exception(f"API返回异常: {err_msg}")
+        self._record_usage(result)
         return result['choices'][0]['message']['content'].strip()
 
 
@@ -948,7 +1181,7 @@ class OllamaTranslator(TranslatorBase):
             "model": self.model,
             "messages": [{"role": "user", "content": "ok"}],
             "stream": False,
-            "keep_alive": "-1s",
+            "keep_alive": "5m",
             "options": {"num_predict": 1, "temperature": 0.1},
         }
         self._http_post(url, data)
@@ -973,7 +1206,7 @@ class OllamaTranslator(TranslatorBase):
         data = {
             "model": self.model, "messages": messages,
             "stream": False,
-            "keep_alive": "-1s",  # 防止模型空闲自动卸载（默认5分钟）
+            "keep_alive": "5m",  # 不永久驻留：空闲5分钟自动卸载，避免常占显存
             "options": {
                 "temperature": 0.1,
                 "num_ctx": 16384,  # 利用40K上下文，提到16K减少截断
@@ -1005,7 +1238,7 @@ class OllamaTranslator(TranslatorBase):
                 data_simple = {
                     "model": self.model, "messages": messages_simple,
                     "stream": False,
-                    "keep_alive": "-1s",
+                    "keep_alive": "5m",
                     "options": {"temperature": 0.1, "num_ctx": 2048, "num_predict": 1024},
                 }
                 try:
@@ -1034,7 +1267,7 @@ class OllamaTranslator(TranslatorBase):
         ]
         data = {
             "model": self.model, "messages": messages, "stream": False,
-            "keep_alive": "-1s",
+            "keep_alive": "5m",
             "options": {"temperature": 0.1, "num_ctx": 16384, "num_predict": 2048},
         }
         result = self._http_post(url, data)
@@ -1221,8 +1454,8 @@ class TranslatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"MTool翻译工具 v{VERSION}")
-        self.root.geometry("880x760")
-        self.root.minsize(780, 640)
+        self.root.geometry("1100x900")
+        self.root.minsize(900, 700)
 
         self.input_file = tk.StringVar()
         self.output_file = tk.StringVar(value="ManualTransFile.json")
@@ -1242,9 +1475,11 @@ class TranslatorApp:
         self.max_workers = tk.IntVar(value=8)
         self.max_retry = tk.IntVar(value=3)
         self.chunk_size = tk.IntVar(value=1500)
-        self.batch_size = tk.IntVar(value=5)  # LLM批量翻译条数，0=禁用
+        self.batch_size = tk.IntVar(value=10)  # LLM批量翻译条数，0=禁用
         self.protect_placeholders = tk.BooleanVar(value=True)  # 占位符保护开关
-        self.protect_patterns = tk.StringVar(value=r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>")  # 保护规则正则
+        # 保护规则正则：覆盖通用 + 游戏引擎变量格式
+        # {name} / %s / $var / <tag> / [name](RenPy插值) / \V[1] \N[1] \I[1] \C[1](RPGMaker) / %name%(Tyrano) / [[...]]等
+        self.protect_patterns = tk.StringVar(value=r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>|\[[a-zA-Z_][a-zA-Z0-9_]*\]|\\[VvNnIiCc]\s*\[\d+\]|%[a-zA-Z_][a-zA-Z0-9_]*%|\[\[[^\]]+\]\]")  # 保护规则正则
         self.translation_cache = {}  # 翻译缓存：{原文: 译文}，避免重复翻译
         # 自适应背压：监控429频率自动调整请求间隔（按引擎隔离，避免A引擎限流拖累B引擎）
         self.rate_state = {}  # {engine_name: {"cooldown": 0.0, "429_timestamps": [], "success_count": 0, "total_count": 0}}
@@ -1259,6 +1494,21 @@ class TranslatorApp:
         self.translated_chars = 0
         self.start_time = 0
         self.total_elapsed = 0
+        # 最近一轮在线LLM的Prompt Cache统计（用于完成提示、详细报告、费用估算）
+        self.last_cache_stats = None
+        # Prompt Cache实时监控：当前活动引擎/预热状态
+        self._active_cache_translators = []
+        self._cache_monitor_after_id = None
+        self.cache_status_var = tk.StringVar(value="缓存监控：未开始")
+        self.cache_hit_var = tk.StringVar(value="命中率：--")
+        self.cache_token_var = tk.StringVar(value="命中/未命中：0 / 0")
+        self.cache_req_var = tk.StringVar(value="请求：0")
+        self.cache_cost_var = tk.StringVar(value="费用：--")
+        self.cache_save_var = tk.StringVar(value="缓存节省：--")
+        self.cache_warmup_var = tk.StringVar(value="预热：未执行")
+        # Unity 提取文件特征：命中特征码后启用 Unity 专属乱码跳过模式
+        self._unity_skip_mode = False
+        self._file_meta = None
 
         # 新增功能变量
         self.dark_mode = tk.BooleanVar(value=False)
@@ -1293,9 +1543,14 @@ class TranslatorApp:
         # ===== 翻译校准（语义校验，用Ollama embedding检测术语错误） =====
         self.enable_semantic_check = tk.BooleanVar(value=False)
         self.semantic_ollama_url = tk.StringVar(value="http://localhost:11434")
-        self.semantic_model = tk.StringVar(value="nomic-embed-text")
+        self.semantic_model = tk.StringVar(value="yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0")
         self.semantic_threshold = tk.DoubleVar(value=0.75)  # 相似度低于此值视为术语错误
         self._semantic_cache = {}  # 语义相似度缓存，避免重复计算
+        # ===== embedding 智能识别免翻内容（翻译前用本地embedding判断类似资源名/代码的文本，自动跳过） =====
+        self.embed_skip_enable = tk.BooleanVar(value=False)
+        self.embed_skip_threshold = tk.DoubleVar(value=0.30)  # 与"剧情/自然语言"样本相似度低于此值→判定免翻
+        self._embed_skip_vectors = None  # 免翻样本库向量缓存
+        self._embed_skip_map = {}  # 本次翻译批量扫描结果：{原文: True/False}，逐条翻译时直接查表避免重复embedding调用
 
         self._loading_config = False
         # 配置文件保存在exe/脚本同目录（兼容PyInstaller打包）
@@ -1306,11 +1561,27 @@ class TranslatorApp:
             self._config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_config.json")
             self._plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
+        # ===== 持久化翻译缓存（跨会话复用, 减少重复API调用/省钱）=====
+        self._cache_file = os.path.join(os.path.dirname(self._config_file), "translation_cache.json")
+        self._cache_dirty = 0
+
+        # ===== 固定术语表（DeepSeek前缀缓存增强）=====
+        # term_glossary.txt 每行 "源词=译文"，放system前缀里做长固定前缀；缺失则跳过不影响使用
+        self._glossary_text = ""
+        try:
+            gf = os.path.join(os.path.dirname(self._config_file), "term_glossary.txt")
+            if os.path.exists(gf):
+                with open(gf, "r", encoding="utf-8") as f:
+                    self._glossary_text = f.read().strip()
+        except Exception:
+            pass
+
         self._build_ui()
         self._on_api_change()
         self._load_auto_config()
         self._setup_auto_save()
         self._load_plugins()
+        self._load_translation_cache()
 
     def _build_ui(self):
         # 菜单栏
@@ -1328,14 +1599,14 @@ class TranslatorApp:
         menubar.add_cascade(label="主题", menu=theme_menu)
 
         # 工具菜单
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        tools_menu.add_command(label="插件管理器", command=self._plugin_manager)
-        tools_menu.add_command(label="打开插件目录", command=self._open_plugin_dir)
-        tools_menu.add_command(label="新建插件模板", command=self._create_plugin_template)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="WebHook通知设置", command=self._webhook_settings)
-        tools_menu.add_command(label="刷新插件列表", command=self._load_plugins)
-        menubar.add_cascade(label="工具", menu=tools_menu)
+        self.tools_menu = tk.Menu(menubar, tearoff=0)
+        self.tools_menu.add_command(label="插件管理器", command=self._plugin_manager)
+        self.tools_menu.add_command(label="打开插件目录", command=self._open_plugin_dir)
+        self.tools_menu.add_command(label="新建插件模板", command=self._create_plugin_template)
+        self.tools_menu.add_separator()
+        self.tools_menu.add_command(label="WebHook通知设置", command=self._webhook_settings)
+        self.tools_menu.add_command(label="刷新插件列表", command=self._load_plugins)
+        menubar.add_cascade(label="工具", menu=self.tools_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="检查更新", command=self._check_updates_manual)
@@ -1357,21 +1628,21 @@ class TranslatorApp:
         tab1 = ttk.Frame(nb, padding=10)
         nb.add(tab1, text="基本设置")
 
-        file_frame = ttk.LabelFrame(tab1, text="文件设置", padding=8)
-        file_frame.pack(fill=tk.X, pady=(0, 8))
+        self.file_frame = ttk.LabelFrame(tab1, text="文件设置", padding=8)
+        self.file_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(file_frame, text="输入文件:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.input_file_entry = ttk.Entry(file_frame, textvariable=self.input_file, width=70)
+        ttk.Label(self.file_frame, text="输入文件:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.input_file_entry = ttk.Entry(self.file_frame, textvariable=self.input_file, width=70)
         self.input_file_entry.grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(file_frame, text="浏览...", command=self._browse_input).grid(row=0, column=2, pady=2)
+        ttk.Button(self.file_frame, text="浏览...", command=self._browse_input).grid(row=0, column=2, pady=2)
 
-        ttk.Label(file_frame, text="输出文件:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(file_frame, textvariable=self.output_file, width=70).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(file_frame, text="浏览...", command=self._browse_output).grid(row=1, column=2, pady=2)
+        ttk.Label(self.file_frame, text="输出文件:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(self.file_frame, textvariable=self.output_file, width=70).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Button(self.file_frame, text="浏览...", command=self._browse_output).grid(row=1, column=2, pady=2)
 
-        ttk.Label(file_frame, text="进度文件:").grid(row=2, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(file_frame, textvariable=self.progress_file, width=70).grid(row=2, column=1, padx=5, pady=2)
-        ttk.Button(file_frame, text="清除进度", command=self._clear_progress).grid(row=2, column=2, pady=2)
+        ttk.Label(self.file_frame, text="进度文件:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(self.file_frame, textvariable=self.progress_file, width=70).grid(row=2, column=1, padx=5, pady=2)
+        ttk.Button(self.file_frame, text="清除进度", command=self._clear_progress).grid(row=2, column=2, pady=2)
 
         # 语言设置
         lang_frame = ttk.LabelFrame(tab1, text="语言设置", padding=8)
@@ -1448,7 +1719,15 @@ class TranslatorApp:
 
         # 第二阶段：LLM精修
         ttk.Label(refine_frame, text="【第二阶段·LLM精修】", foreground="#FF9800", font=("微软雅黑", 9, "bold")).grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(8, 2))
-        ttk.Label(refine_frame, text="LLM配置：直接使用上方「API设置」页的OpenAI兼容引擎（BaseURL/Key/模型）", foreground="gray").grid(row=6, column=0, columnspan=7, sticky=tk.W, padx=5, pady=2)
+        ttk.Label(refine_frame, text="LLM配置(留空则用上方API设置页):").grid(row=6, column=0, sticky=tk.W, padx=5, pady=2)
+        self.refine_llm_base_url_entry = ttk.Entry(refine_frame, textvariable=self.refine_llm_base_url, width=24)
+        self.refine_llm_base_url_entry.grid(row=6, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(refine_frame, text="Key:").grid(row=6, column=2, sticky=tk.W, padx=(8, 2), pady=2)
+        self.refine_llm_key_entry = ttk.Entry(refine_frame, textvariable=self.refine_llm_api_key, width=20, show="*")
+        self.refine_llm_key_entry.grid(row=6, column=3, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(refine_frame, text="模型:").grid(row=6, column=4, sticky=tk.W, padx=(8, 2), pady=2)
+        self.refine_llm_model_entry = ttk.Entry(refine_frame, textvariable=self.refine_llm_model, width=26)
+        self.refine_llm_model_entry.grid(row=6, column=5, padx=5, pady=2, sticky=tk.W)
         ttk.Label(refine_frame, text="并发:").grid(row=7, column=0, sticky=tk.W, padx=5, pady=2)
         ttk.Spinbox(refine_frame, from_=1, to=32, textvariable=self.refine_workers, width=8).grid(row=7, column=1, padx=5, pady=2, sticky=tk.W)
         ttk.Label(refine_frame, text="阈值:").grid(row=7, column=2, sticky=tk.W, padx=(15, 5), pady=2)
@@ -1458,15 +1737,23 @@ class TranslatorApp:
         ttk.Entry(refine_frame, textvariable=self.refine_prompt, width=70).grid(row=8, column=1, columnspan=6, padx=5, pady=2, sticky=tk.W+tk.E)
         refine_frame.columnconfigure(6, weight=1)
 
-        ttk.Label(refine_frame, text="流程：①用预翻译引擎（默认谷歌）快速翻译全部 → ②自动评估质量 → ③对低于阈值的条目用API设置页配置的LLM重新精修。开启后预翻译阶段使用本区域配置，精修阶段使用上方API设置页的LLM配置。", foreground="gray", wraplength=800).grid(row=9, column=0, columnspan=7, sticky=tk.W, padx=5, pady=(5, 0))
+        ttk.Label(refine_frame, text="流程：①用预翻译引擎（默认谷歌）快速翻译全部 → ②自动评估质量 → ③对低于阈值的条目用上方填写的LLM重新精修。精修LLM留空时使用上方API设置页配置；本地Ollama填 http://localhost:11434 无需Key。", foreground="gray", wraplength=800).grid(row=9, column=0, columnspan=7, sticky=tk.W, padx=5, pady=(5, 0))
 
         # ===== 翻译校准（语义校验，用Ollama embedding检测术语错误） =====
         semantic_frame = ttk.LabelFrame(tab1, text="翻译校准（语义校验 · Ollama本地embedding检测术语错误）", padding=8)
         semantic_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Checkbutton(semantic_frame, text="启用翻译校准（翻译完成后自动检测术语错误，如神殿→寺庙）", variable=self.enable_semantic_check).grid(row=0, column=0, sticky=tk.W, padx=5)
+        # 翻译校准 = 翻译【完成之后】的译文校验（前置条件，子项在下面）
+        ttk.Checkbutton(semantic_frame, text="①【翻译后】启用翻译校准（翻译完成→embedding比对原文/译文语义，跑偏的自动重翻，如神殿→寺庙）", variable=self.enable_semantic_check).grid(row=0, column=0, sticky=tk.W, padx=5)
         ttk.Button(semantic_frame, text="翻译校准设置", command=self._semantic_settings_dialog).grid(row=0, column=1, sticky=tk.E, padx=5)
         semantic_frame.columnconfigure(0, weight=1)
+        # embedding 智能识别免翻内容 = 翻译【开始之前】的垃圾过滤（独立开关，与翻译校准无关）
+        ttk.Checkbutton(semantic_frame, text="②【翻译前】embedding智能免翻（扫描后先跳过资源名/代码/内部名，再送LLM翻译）",
+                        variable=self.embed_skip_enable).grid(row=1, column=0, sticky=tk.W, padx=5, pady=(4, 2))
+        ttk.Label(semantic_frame, text="相似阈值:").grid(row=1, column=1, sticky=tk.E, padx=(15, 3), pady=(4, 2))
+        ttk.Entry(semantic_frame, textvariable=self.embed_skip_threshold, width=8).grid(row=1, column=2, sticky=tk.W, pady=(4, 2))
+        ttk.Label(semantic_frame, text="（与剧情文本相似度低于此值 → 判为非自然语言免翻）", foreground="gray").grid(row=1, column=3, sticky=tk.W, padx=(4, 0), pady=(4, 2))
+        ttk.Label(semantic_frame, text="说明：①②是独立开关，①管翻译后校验译文，②管翻译前过滤垃圾，可同时勾选", foreground="gray").grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=5, pady=(2, 0))
 
         # ===== 页2：API设置 =====
         tab2 = ttk.Frame(nb, padding=10)
@@ -1663,6 +1950,21 @@ class TranslatorApp:
         ttk.Button(btn_frame, text="统计信息", command=self._show_stats).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="费用预估", command=self._show_cost_estimate).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="详细报告", command=self._show_detailed_stats).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="缓存预热", command=self._manual_cache_warmup).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(btn_frame, text="缓存监控", command=self._show_cache_monitor).pack(side=tk.LEFT, padx=(5, 0))
+
+        # Prompt Cache实时监控面板
+        cache_frame = ttk.LabelFrame(tab3, text="DeepSeek Prompt Cache 实时监控", padding=7)
+        cache_frame.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(cache_frame, textvariable=self.cache_status_var).grid(row=0, column=0, columnspan=4, sticky=tk.W, padx=5, pady=(0, 4))
+        ttk.Label(cache_frame, textvariable=self.cache_hit_var, font=("微软雅黑", 10, "bold")).grid(row=1, column=0, sticky=tk.W, padx=5)
+        ttk.Label(cache_frame, textvariable=self.cache_token_var).grid(row=1, column=1, sticky=tk.W, padx=12)
+        ttk.Label(cache_frame, textvariable=self.cache_req_var).grid(row=1, column=2, sticky=tk.W, padx=12)
+        ttk.Label(cache_frame, textvariable=self.cache_cost_var).grid(row=1, column=3, sticky=tk.W, padx=12)
+        ttk.Label(cache_frame, textvariable=self.cache_save_var).grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=5, pady=(4, 0))
+        ttk.Label(cache_frame, textvariable=self.cache_warmup_var, foreground="gray").grid(row=3, column=0, columnspan=4, sticky=tk.W, padx=5, pady=(2, 0))
+        for i in range(4):
+            cache_frame.columnconfigure(i, weight=1)
 
         # 日志
         log_frame = ttk.LabelFrame(tab3, text="日志", padding=5)
@@ -1671,6 +1973,91 @@ class TranslatorApp:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=15, font=("Consolas", 9), wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.config(state=tk.DISABLED)
+        self.root.after(500, self._update_cache_monitor)
+
+    def _aggregate_cache_stats(self):
+        """聚合当前活动引擎的Prompt Cache统计。"""
+        agg = {"hit": 0, "miss": 0, "prompt": 0, "completion": 0, "requests": 0, "warmups": 0}
+        for translator in list(getattr(self, '_active_cache_translators', []) or []):
+            if isinstance(translator, OpenAICompatTranslator):
+                snap = translator.cache_stats_snapshot()
+                for k in ("hit", "miss", "prompt", "completion", "requests"):
+                    agg[k] += int(snap.get(k, 0) or 0)
+        return agg
+
+    def _update_cache_monitor(self):
+        """每秒刷新缓存监控面板。"""
+        try:
+            stats = self._aggregate_cache_stats()
+            total = stats['hit'] + stats['miss']
+            pct = (stats['hit'] * 100.0 / total) if total else 0.0
+            self.cache_hit_var.set(f"命中率：{pct:.1f}%" if total else "命中率：--")
+            self.cache_token_var.set(f"命中/未命中：{stats['hit']:,} / {stats['miss']:,}")
+            self.cache_req_var.set(f"请求：{stats['requests']}")
+            report = self._deepseek_cache_cost(stats) if total else None
+            if report:
+                self.cache_cost_var.set(f"费用：¥{report['actual_cost']:.4f}")
+                self.cache_save_var.set(f"缓存读 {stats.get('cache_read',0):,} · 写 {stats.get('cache_write',0):,} · 输入 {stats['prompt']:,} · 输出 {stats['completion']:,}")
+            elif total:
+                self.cache_cost_var.set("费用：当前模型未配置官方价格")
+                self.cache_save_var.set(f"缓存Token：{total:,} · 输入 {stats['prompt']:,} · 输出 {stats['completion']:,}")
+            else:
+                self.cache_cost_var.set("费用：--")
+                self.cache_save_var.set("缓存节省：--")
+            if self.is_running:
+                self.cache_status_var.set("状态：翻译进行中 · 正在实时统计 Prompt Cache")
+            elif self._active_cache_translators:
+                self.cache_status_var.set("状态：上一轮翻译统计")
+            else:
+                self.cache_status_var.set("缓存监控：未开始")
+            self._cache_monitor_after_id = self.root.after(1000, self._update_cache_monitor)
+        except Exception:
+            try:
+                self._cache_monitor_after_id = self.root.after(1500, self._update_cache_monitor)
+            except Exception:
+                pass
+
+    def _manual_cache_warmup(self):
+        """手动执行当前语言方向的DeepSeek缓存预热。"""
+        try:
+            translator = self._get_translator()
+            if isinstance(translator, OpenAICompatTranslator):
+                translator._glossary = self._glossary_text
+            if not isinstance(translator, OpenAICompatTranslator) or not translator._is_deepseek():
+                messagebox.showinfo("缓存预热", "当前引擎不是DeepSeek Prompt Cache模式，无需执行缓存预热。")
+                return
+            src = self._get_lang_code(self.source_lang.get())
+            tgt = self._get_lang_code(self.target_lang.get())
+            self.cache_warmup_var.set("预热：正在建立固定前缀缓存…")
+            self._log("🔥 正在执行DeepSeek Prompt Cache自动预热…")
+            def worker():
+                ok, msg = translator.warmup_cache(src, tgt)
+                def done():
+                    self.cache_warmup_var.set(("预热：" + ("成功 · " if ok else "失败 · ") + msg))
+                    self._log(("✅ " if ok else "⚠ ") + "DeepSeek Prompt Cache预热：" + msg)
+                    if not ok:
+                        messagebox.showwarning("缓存预热", msg)
+                self.root.after(0, done)
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            self.cache_warmup_var.set(f"预热：失败 · {str(e)[:120]}")
+            self._log(f"⚠ Prompt Cache预热异常：{e}")
+
+    def _show_cache_monitor(self):
+        """弹出独立缓存监控窗口，显示当前/上一轮详细统计。"""
+        win = tk.Toplevel(self.root)
+        win.title("Prompt Cache 监控")
+        win.geometry("540x300")
+        win.transient(self.root)
+        win.grab_set()
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="DeepSeek Prompt Cache", font=("微软雅黑", 13, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        labels = [self.cache_hit_var, self.cache_token_var, self.cache_req_var, self.cache_cost_var, self.cache_save_var, self.cache_warmup_var]
+        for var in labels:
+            ttk.Label(frame, textvariable=var, font=("微软雅黑", 10)).pack(anchor=tk.W, pady=4)
+        ttk.Label(frame, text="提示：DeepSeek读取 prompt_cache_hit_tokens/miss_tokens；TokenHub兼容 cached_tokens/cache_read_tokens/cache_write_tokens，并为同一任务固定 prompt_cache_key + X-Session-ID。", foreground="gray", wraplength=490).pack(anchor=tk.W, pady=(8, 0))
+        ttk.Button(frame, text="关闭", command=lambda: (win.grab_release(), win.destroy())).pack(anchor=tk.E, pady=(12, 0))
 
     def _toggle_advanced(self):
         """展开/收起高级设置（引擎B）"""
@@ -1739,35 +2126,64 @@ class TranslatorApp:
             tgt = "zh-CN"
 
         self._log(f"正在测试连接: {engine_name} ...")
-        try:
-            translator = self._get_translator()
-            result = translator.translate(test_text, src, tgt)
-            self._log(f"连接成功！译文: {result}")
-            messagebox.showinfo("连接成功",
-                                f"引擎: {engine_name}\n"
-                                f"原文: {test_text}\n"
-                                f"译文: {result}\n\n"
-                                f"API配置可用，可以开始翻译。")
-        except Exception as e:
-            err_msg = str(e)
-            self._log(f"连接失败: {err_msg}")
-            is_timeout = 'timed out' in err_msg.lower() or 'timeout' in err_msg.lower() or 'read timed out' in err_msg.lower()
-            if is_timeout:
-                hint = (f"引擎: {engine_name}\n"
-                       f"错误: 请求超时（模型响应慢或暂时不可用）\n\n"
-                       f"可能原因：\n"
-                       f"1. 当前模型在平台上过载/排队/维护\n"
-                       f"2. 网络连接不稳定\n\n"
-                       f"建议：\n"
-                       f"• 换个模型试试（如 Qwen/Qwen2.5-7B-Instruct）\n"
-                       f"• 稍等几分钟后重试\n"
-                       f"• 检查API Key是否有效")
-                messagebox.showwarning("连接超时", hint)
-            else:
-                messagebox.showerror("连接失败",
-                                     f"引擎: {engine_name}\n"
-                                     f"错误: {err_msg}\n\n"
-                                     f"请检查API参数、网络连接和额度。")
+        # 网络请求放到后台线程：死代理/被墙时主线程不再卡住导致窗口"未响应"
+        def _test_worker():
+            try:
+                translator = self._get_translator()
+                result = translator.translate(test_text, src, tgt)
+                def _ok():
+                    self._log(f"连接成功！译文: {result}")
+                    messagebox.showinfo("连接成功",
+                                        f"引擎: {engine_name}\n"
+                                        f"原文: {test_text}\n"
+                                        f"译文: {result}\n\n"
+                                        f"API配置可用，可以开始翻译。")
+                self.root.after(0, _ok)
+            except Exception as e:
+                err_msg = str(e)
+                self.root.after(0, lambda: self._test_connection_error(engine_name, err_msg))
+        threading.Thread(target=_test_worker, daemon=True).start()
+
+    def _test_connection_error(self, engine_name, err_msg):
+        """测试连接失败的统一提示（主线程执行）"""
+        self._log(f"连接失败: {err_msg}")
+        err_lower = err_msg.lower()
+        is_timeout = 'timed out' in err_lower or 'timeout' in err_lower or 'read timed out' in err_lower
+        is_dns = any(k in err_lower for k in ('nameresolution', 'getaddrinfo failed', 'name or service not known'))
+        is_worker_dead = ('<!doctype' in err_lower or '<html' in err_lower
+                          or 'worker' in err_lower and '失效' in err_msg)
+        if is_worker_dead:
+            hint = (f"引擎: {engine_name}\n"
+                    f"错误: 代理Worker已失效（返回网页/被拦截，不是翻译接口）\n\n"
+                    f"「谷歌代理池」里的 Worker 地址已经不能用了（域名被回收/Worker被删除/被CF拦截）。\n\n"
+                    f"建议：\n"
+                    f"• 到 Cloudflare Dashboard 重新部署 Worker，用新的地址（推荐 xxx.workers.dev 或自有域名）\n"
+                    f"• 或清空「谷歌翻译代理」改走直连（需要能直连谷歌的网络）")
+            messagebox.showwarning("代理已失效", hint)
+        elif is_dns:
+            hint = (f"引擎: {engine_name}\n"
+                    f"错误: 代理域名无法解析（DNS失败）\n\n"
+                    f"「谷歌代理池」里填的 Worker 地址已失效（域名被回收/Worker被删除）。\n\n"
+                    f"建议：\n"
+                    f"• 重新部署 CF Worker（帮助→CF Worker代理教程），换一个新地址填入「谷歌翻译代理」\n"
+                    f"• 或清空「谷歌翻译代理」改走直连（需要能直连谷歌的网络）")
+            messagebox.showwarning("代理不可用", hint)
+        elif is_timeout:
+            hint = (f"引擎: {engine_name}\n"
+                   f"错误: 请求超时（模型响应慢或暂时不可用）\n\n"
+                   f"可能原因：\n"
+                   f"1. 当前模型在平台上过载/排队/维护\n"
+                   f"2. 网络连接不稳定\n\n"
+                   f"建议：\n"
+                   f"• 换个模型试试（如 Qwen/Qwen2.5-7B-Instruct）\n"
+                   f"• 稍等几分钟后重试\n"
+                   f"• 检查API Key是否有效")
+            messagebox.showwarning("连接超时", hint)
+        else:
+            messagebox.showerror("连接失败",
+                                 f"引擎: {engine_name}\n"
+                                 f"错误: {err_msg}\n\n"
+                                 f"请检查API参数、网络连接和额度。")
 
     def _format_model_price(self, model_name):
         """格式化模型价格用于显示"""
@@ -1801,7 +2217,7 @@ class TranslatorApp:
         if is_ollama:
             url = f"{base}/api/tags"
         else:
-            url = f"{base}/models"
+            url = f"{_norm_base(base)}/models"
         self._log(f"正在获取模型列表: {url}")
         # 放到后台线程执行，避免阻塞UI
         def run_fetch():
@@ -2137,7 +2553,7 @@ class TranslatorApp:
                     url = f"{ollama_base}/api/tags"
                     headers = {'User-Agent': 'Mozilla/5.0'}
                 else:
-                    url = f"{base}/models"
+                    url = f"{_norm_base(base)}/models"
                     headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {api_key}'}
                 req = _req.Request(url, headers=headers)
                 ctx = ssl.create_default_context()
@@ -2266,7 +2682,15 @@ class TranslatorApp:
 
     def _get_lang_code(self, lang_str):
         if '(' in lang_str and ')' in lang_str:
-            return lang_str.rsplit('(', 1)[-1].rstrip(')')
+            return lang_str.rsplit('(', 1)[-1].rstrip(')').strip()
+        # 兼容中文显示名（如 config 里存的"简体中文"/"自动检测"）→ 转语言代码
+        s = lang_str.strip()
+        for code, name in LANG_NAMES.items():
+            if s == name:
+                return code
+        for name, code in LANGUAGES:
+            if s == name:
+                return code
         return lang_str
 
     def _parse_google_proxies(self):
@@ -2496,8 +2920,69 @@ class TranslatorApp:
                 dlg.destroy()
             except Exception as e:
                 messagebox.showerror("错误", f"保存失败：{e}", parent=dlg)
+        def _llm_refine_selected():
+            """把选中的校准检出条目直接送LLM精修（机翻→校准→LLM工作流）"""
+            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            if not selected:
+                messagebox.showinfo("提示", "请先勾选要精修的条目", parent=dlg)
+                return
+            if not messagebox.askyesno("确认", f"确定用LLM精修选中的 {len(selected)} 条？\n将使用API设置页的LLM逐条精修这些条目。", parent=dlg):
+                return
+            inf = self.input_file.get()
+            if not inf or not os.path.exists(inf):
+                messagebox.showerror("错误", "找不到输入文件", parent=dlg)
+                return
+            # 前置检查：API设置页需配置LLM才能精修
+            if not self.api_key.get().strip() or not self.base_url.get().strip() or not self.model.get().strip():
+                messagebox.showerror("错误",
+                    "API设置页未配置LLM（API Key / Base URL / 模型），无法精修。\n请先在「API设置」配置后再试。", parent=dlg)
+                return
+            # 构造 force_refine 列表（跳过质量筛选，直接精修校准检出的条目）
+            force_items = []
+            for idx in selected:
+                source, target, sim = issues_sorted[idx]
+                force_items.append((source, target, 0, True))
+            dlg.grab_release()
+            # 后台线程执行精修，完成后写回文件
+            def _worker():
+                try:
+                    self._run_refine_phase(data, src, tgt, force_refine=force_items)
+                    # 精修结果在 self.translated 中，写回文件
+                    updated = 0
+                    for source, _, _, _ in force_items:
+                        if source in self.translated and self.translated[source] != source:
+                            data[source] = self.translated[source]
+                            updated += 1
+                    with open(inf, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    pf = self.progress_file.get()
+                    if pf:
+                        with open(pf, 'w', encoding='utf-8') as f:
+                            json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                    self._log(f"翻译校准→LLM精修：{len(force_items)} 条已精修，成功更新 {updated} 条，已保存")
+                    # 在主线程收尾：弹窗可能已被用户关闭，需 winfo_exists 保护
+                    def _done():
+                        try:
+                            if dlg.winfo_exists():
+                                messagebox.showinfo("完成",
+                                    f"LLM精修完成：{len(force_items)} 条待精修，成功 {updated} 条。\n已写回文件。", parent=dlg)
+                                dlg.destroy()
+                        except Exception:
+                            pass
+                    self.root.after(0, _done)
+                except Exception as e:
+                    self._log(f"翻译校准→LLM精修失败: {e}")
+                    def _err():
+                        try:
+                            if dlg.winfo_exists():
+                                messagebox.showerror("错误", f"精修失败：{e}", parent=dlg)
+                        except Exception:
+                            pass
+                    self.root.after(0, _err)
+            threading.Thread(target=_worker, daemon=True).start()
         ttk.Button(btn_frame, text="全选", command=lambda: [v.set(True) for v in check_vars]).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="全不选", command=lambda: [v.set(False) for v in check_vars]).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="送LLM精修选中条目", command=_llm_refine_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="清空选中译文并重新翻译", command=_clear_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
 
@@ -2626,32 +3111,108 @@ class TranslatorApp:
         result.append(text[last_end:])
         return ''.join(result), mapping
 
+    @staticmethod
+    def _marker_alt_forms(marker):
+        """生成占位符标记的括号变体（LLM常改写括号样式）：英文[]、全角【】"""
+        forms = []
+        e = marker.replace('〔', '[').replace('〕', ']')
+        if e != marker:
+            forms.append(e)
+        j = marker.replace('〔', '【').replace('〕', '】')
+        if j != marker:
+            forms.append(j)
+        return forms
+
     def _restore_text(self, text, mapping):
-        """将译文中的标记还原为原始占位符（支持大小写不敏感匹配），并验证还原结果"""
+        """将译文中的标记还原为原始占位符（支持大小写不敏感 + 中/英/全角方括号变体），并验证还原结果"""
         if not mapping:
             return text
         result = text
         for marker, original in mapping:
-            # 先精确替换
+            # 1. 精确替换（中文直角括号 〔〕）
             result = result.replace(marker, original)
-            # 再尝试大小写不敏感替换（防止LLM修改了标记大小写）
+            # 2. 大小写不敏感替换（防止LLM修改了标记大小写）
+            #    注意：必须用 lambda 替换，否则 original 含反斜杠（如 \V[1]）会被当正则模板报 bad escape
             pattern = re.compile(re.escape(marker), re.IGNORECASE)
-            result = pattern.sub(original, result)
-        # 验证1：检查是否还有未还原的标记（〔NL数字〕或〔PHX数字〕）
-        leftover = re.findall(r'〔(?:NL|PHX)\d+〕', result)
+            result = pattern.sub(lambda m: original, result)
+            # 3. 兼容括号变体：LLM常把 〔NL0〕 改成 [NL0] 或 【NL0】（实测大量发生）
+            for alt in self._marker_alt_forms(marker):
+                result = result.replace(alt, original)
+                result = re.sub(re.escape(alt), lambda m: original, result, flags=re.IGNORECASE)
+        # 验证1：检查是否还有未还原的标记（各种括号形式）
+        leftover = re.findall(r'[〔\[【]?(?:NL|PHX)\d+[〕\]】]?', result)
         if leftover:
-            # 标记未被还原，可能是LLM丢弃了标记的一部分
+            # 标记未被还原，可能是LLM丢弃了标记的一部分，按各种形式兜底还原
             for marker, original in mapping:
-                if marker in leftover:
-                    result = result.replace(marker, original)
-        # 验证2：换行数对比（标记可能被翻译API完全丢弃）
-        expected_nl = sum(1 for _, orig in mapping if orig == '\n')
-        actual_nl = result.count('\n')
-        if expected_nl > 0 and actual_nl < expected_nl:
-            # 译文换行少于原文，补回缺失的换行（保守策略，追加到末尾）
-            missing = expected_nl - actual_nl
-            result = result + '\n' * missing
+                for form in ([marker] + self._marker_alt_forms(marker)):
+                    if form in result:
+                        result = re.sub(re.escape(form), lambda m: original, result, flags=re.IGNORECASE)
+        # 验证2：换行数对比——标记若已正确还原为\n则此处不触发；
+        #         仅当NL标记被LLM完全丢弃(连变体都没有)时才补回，避免多余堆叠
+        leftover_nl = re.findall(r'[〔\[【]NL\d+[〕\]】]', result)
+        if not leftover_nl:
+            expected_nl = sum(1 for _, orig in mapping if orig == '\n')
+            actual_nl = result.count('\n')
+            if expected_nl > 0 and actual_nl < expected_nl:
+                # 译文换行少于原文，补回缺失的换行（保守策略，追加到末尾）
+                missing = expected_nl - actual_nl
+                result = result + '\n' * missing
         return result
+
+    def _is_code_or_noise(self, text):
+        """判断原文是否为代码/样式/着色器/乱码等非自然语言文本（如 GLSL 着色器、CSS 选择器、
+        JS 片段、二进制乱码）。这类文本 LLM 原样返回属预期：保留原文即可，不算翻译失败。
+        只影响"返回原文是否计失败/重试"，不影响正常文本的翻译。"""
+        if not text:
+            return False
+        t = text.strip()
+        if not t:
+            return False
+        has_cjk = any('\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' for c in t)
+        # 单个非中日韩字符（如 A/O/g/1）无法构成有效翻译目标
+        if len(t) <= 1 and not has_cjk:
+            return True
+        low = t[:400]
+        # GLSL/HLSL 着色器特征关键字
+        shader_kws = ('vec2 ', 'vec3 ', 'vec4 ', 'mat2 ', 'mat3 ', 'mat4 ', 'uniform ',
+                      'attribute ', 'varying ', '#ifdef', '#ifndef', '#if ', '#endif',
+                      '#define', '#include', 'void main', 'texture2D', 'textureCube',
+                      'textureLod', 'gl_', 'float4', 'half4', 'sampler', 'morphTarget',
+                      'bindMatrix', 'envMap', 'USE_', 'perturbNormal')
+        if any(kw in t or kw in low for kw in shader_kws):
+            return True
+        # JS/HTML/CSS 特征
+        web_kws = ('<script', '</div', '</span', '<img', 'onclick=', 'style="', '!important',
+                   'querySelector', 'getElementById', 'addEventListener', 'function(',
+                   'typeof ', 'data-src', 'data-event', ':not(', ':last-child', ':first-child',
+                   'getBoundingClientRect', '.jpg', '.png', '.ogg', '.wav', '.webm')
+        if any(kw in t or kw in low for kw in web_kws):
+            return True
+        # CSS 规则形如 selector { prop: val; }
+        if re.search(r'[.#\w\-\[][^{}]*\{[^{}]*:[^{}]*\}', t):
+            return True
+        # 纯选择器/ID/类名/色值（如 #tyrano_base / .layer_camera / #FFFF99）
+        if not has_cjk and re.match(r'^[.#][\w-]+$', t):
+            return True
+        # 属性选择器（如 img[data-event-tag=button][data-src]）
+        if not has_cjk and re.search(r'\[[\w-]+(=[\w\'"]+)?\]', t):
+            return True
+        # 代码标识符：含下划线（tb_save_img）或驼峰（getWidthReplay）→ 非自然语言
+        if not has_cjk and re.search(r'\w+_\w+|[a-z][A-Z]\w*', t):
+            return True
+        # 无中日韩时符号密度高 → 代码（{}();=<>+*/|&[]:#, 占比≥12%）
+        if not has_cjk:
+            sym = sum(1 for c in t if c in '{}();=<>+*/|&[]:#,')
+            letters = sum(1 for c in t if c.isalpha())
+            if letters >= 3 and sym >= max(3, int(len(t) * 0.12)):
+                return True
+        # 乱码：扩展拉丁/希腊/西里尔特殊字母混入纯ASCII串（如 ZWȴ-OBIr / H3tFǨ）。
+        # 正常西文重音（é ü ñ 等）在 Latin-1 补充区(\u00a0-\u00ff)，不在此范围，不会误判。
+        weird = sum(1 for c in t if '\u0100' <= c <= '\u024f' or '\u0370' <= c <= '\u04ff'
+                    or '\u1d00' <= c <= '\u1d7f' or '\u2c60' <= c <= '\u2c7f')
+        if weird >= 1:
+            return True
+        return False
 
     def _should_skip_translation(self, text):
         """判断文本是否不需要翻译（纯数字、URL、路径、邮箱、占位符等），是则返回True。
@@ -2660,8 +3221,74 @@ class TranslatorApp:
             return True
         t = text.strip()
         t_lower = t.lower()
+        # ===== Unity 专属跳过模式（仅当识别到 Unity 提取文件特征码时启用）=====
+        # 该文件 90% 是二进制乱码/资源名/路径/shader名，专门过滤且不影响普通游戏文本
+        if self._unity_skip_mode:
+            # U6. 引擎本地化表（Key\t日\t英 字典）→ 非游戏对话，跳过（含假名也跳）
+            if '\t' in t:
+                return True
+            # U7. 含韩文谚文（日文游戏里韩文=解码乱码，如 삺AڊJ）
+            if re.search(r'[\uac00-\ud7af]', t):
+                return True
+            # U1. 无中日韩/假名 + 无空格 + 含乱码符号 → 二进制乱码/路径/文件名/资源名
+            #     覆盖 WREH7?Dn、'o`5oMC#、-k\0ņ]、resources.assets、Hidden/InternalErrorShader 等
+            if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t) and ' ' not in t:
+                if re.search(r'[?@#$%^&*()\[\]{}<>~|;,_:\.`\\+\-/]', t):
+                    return True
+                # U2. 无真实英文词（无连续3+小写字母）→ 乱码（ZWȴ-OBIr / H3tFǨ / sŋf）
+                #     或含非ASCII杂项字符（西里尔/上标等，如 8Mwⁿbcf / BootCustomProjectSettingZ8ˉAS）
+                if not re.search(r'[a-z]{3,}', t):
+                    return True
+                if re.search(r'[^\x00-\x7f]', t):
+                    return True
+                # U3. 全大写短码（DPZDV-8K / -END- / QQQ---，无小写字母）
+                if len(t) <= 16 and re.fullmatch(r'[A-Z0-9_\-\.]+', t):
+                    return True
+            # U4 已提取为通用规则（见下方"短中文乱码"），所有文件生效，此处不再重复
+            # U5. Unity 内置资源/输入名（无假名、非游戏文本）
+            if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff]', t):
+                if t_lower.startswith(('library/', 'resources/', 'assets/', 'streamingassets/',
+                                       'hidden/', 'legacy ', 'legacy shaders/', 'standard', 'autodesk ', 'gui/',
+                                       'particles/', 'nature/', 'mobile/', 'unlit/', 'ui/', 'sprites/',
+                                       'fx/', 'skybox/', 'default-pbr/', 'unity', 'unityengine')):
+                    return True
+                # 输入轴/按键/层级名：全小写短词组合（left ctrl / mouse 0 / joystick button 3 / ignore raycast）
+                if re.fullmatch(r'[a-z][a-z0-9 /]*', t_lower) and len(t) <= 25 and \
+                   any(w in t_lower.split() for w in ('mouse', 'joystick', 'button', 'left', 'right',
+                                                      'ctrl', 'alt', 'shift', 'raycast', 'vertical',
+                                                      'horizontal', 'scrollwheel', 'axis', 'ignore')):
+                    return True
+                # U6b. Unity 二进制字符名（如 "S S#S*S/S1S3S8S..."，含反斜杠或#高空格密度）
+                if ('\\' in t) or ('#' in t and t.count(' ') >= len(t) * 0.2):
+                    return True
+                # U8. 超短ASCII乱码: 纯ASCII + ≤8字符 + 无连续3+字母 + 含非字母数字符号
+                #     覆盖 "ZY D / =N XY / I 'b / C y!c 等 Unity 二进制短片段（embedding 对超短文本区分度低, 靠规则拦）
+                #     零误杀: OK/Yes/I'm fine/Save/left 均有连续3+字母, 不命中; 日文文本非纯ASCII, 不命中
+                if all(ord(c) < 128 for c in t) and len(t) <= 8 \
+                        and not re.search(r'[A-Za-z]{3,}', t) and re.search(r'[^A-Za-z0-9 ]', t):
+                    return True
+        # 0. 简单乱码跳过机制（通用，所有文件生效）：
+        #    短中文乱码：CJK/假名 ≤2 且长度≤20，且（含符号 或 含非中日韩非ASCII杂项字符）
+        #    → 二进制/解码乱码。覆盖 cZ0絶~ / 頛&p / }:z壔 / Ӑ郜od / }L愺iV⯘G 等
+        #    （真实日文文本几乎不会 CJK/假名≤2 还夹带符号/杂项字符，不误伤 悠太/初期化/音量）
+        #    排除纯日文短句（假名/汉字+日文标点, 如 えっ？/ね…/お？/はい。）——是真对话语气词, 不按乱码跳过
+        _r0_jp = re.findall(r'[\u4e00-\u9fff\u3040-\u30ff]', t)
+        if len(_r0_jp) <= 2 and len(t) <= 20 and \
+           (re.search(r'[?@#$%^&*()\[\]{}<>~|;,_:\.`\\+\-/]', t) or
+            re.search(r'[^\x00-\x7f\u4e00-\u9fff\u3040-\u30ff]', t)):
+            if not (bool(_r0_jp) and re.fullmatch(
+                    r'[\u3040-\u30ff\u4e00-\u9fff\u3000-\u303f\uff01-\uff5e\u2010-\u2015\u2026\u30fb\u3000 ]+',
+                    t)):
+                return True
         # 1. 路径/文件：包含/且不含空格和中日韩文字，或以常见扩展名结尾
         if '/' in t and ' ' not in t and not re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t):
+            return True
+        # 1b. 路径/分类标签：含/且无空格（即使含日语字符也算，如 IC/厨房/料理、OP/右室商店）
+        #     这类是游戏资源路径/立绘分类，翻译无意义，跳过避免失败重试
+        if '/' in t and ' ' not in t and len(t) <= 40:
+            return True
+        # 1c. 编号+冒号标签：如 63:拘束具、61: 口枷、5-3章 等菜单编号项
+        if re.match(r'^\d{1,3}\s*[:：．.、]\s*\S', t) and len(t) <= 30:
             return True
         if re.search(r'\.(png|jpg|jpeg|gif|bmp|webp|svg|ico|mp3|wav|ogg|flac|aac|mp4|avi|mkv|mov|wmv|flv|json|xml|txt|csv|py|lua|js|ts|html|css|php|java|c|cpp|h|hpp|cs|go|rs|rb|pl|sh|bat|ps1|exe|dll|so|dylib|bin|dat|db|sqlite|zip|rar|7z|tar|gz|bz2|xz|pdf|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|epub|mobi|azw3|ttf|otf|woff|woff2|eot)$', t_lower):
             return True
@@ -2676,19 +3303,72 @@ class TranslatorApp:
             return True
         if len(t) > 15 and re.match(r'^[a-fA-F0-9]+$', t):
             return True  # 十六进制/哈希
-        # 5. 占位符：包含PHX、{}、%、$、<>等
-        if 'PHX' in t or re.search(r'\{[^}]*\}', t) or re.search(r'%[sdif]', t) or re.search(r'\$[a-zA-Z_]', t):
+        if len(t) > 15 and re.match(r'^[a-fA-F0-9h]+$', t):
+            return True  # 十六进制含h的编码串（如 2h3037...）
+        # 5. 占位符：纯占位符/模板文本跳过；但带真实内容的对话（如 "Hello {name}, welcome back"）
+        #    要翻译（占位符由 _protect_text 保护，翻译后还原）——只跳"剥离占位符后无真实文字"的
+        if 'PHX' in t:
             return True
+        _has_ph = re.search(r'\{[^}]*\}', t) or re.search(r'%[sdif]', t) or re.search(r'\$[a-zA-Z_]', t)
+        if _has_ph:
+            _left = re.sub(r'\{[^}]*\}|%[sdif][a-zA-Z_]*|\$[a-zA-Z_]+', '', t).strip()
+            # 剩余无真实文字（字母/中日韩/假名）→ 纯占位符模板，跳过
+            if not _left or not re.search(r'[a-zA-Z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', _left):
+                return True
+            # 剩余有真实内容 → 正常对话，不跳（交给 embedding/LLM，占位符由保护机制还原）
         if re.match(r'^[\(\{\<\[%\$][^\)\}\>\]]*[\)\}\>\]%]$', t):
             return True
+        # 7. 代码标识符/变量名：含下划线或驼峰式英文+数字（如 MT_14 / Torigoya_SaveCommand / MPP_ChoiceEX / ja_JP）
+        #    这些是脚本命令/变量名，翻译会破坏游戏
+        if not re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t) and \
+           re.match(r'^[A-Za-z][A-Za-z0-9_]*$', t) and \
+           ('_' in t or any(c.isupper() for c in t[1:])):
+            return True
+        # 8. 全大写缩写+数字：OP / HP / LV1 / MT15 / UI（游戏UI常用，不翻译）
+        if not re.search(r'[a-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t) and \
+           re.match(r'^[A-Z]{1,6}\d{0,4}$', t):
+            return True
+        # 9. 特殊符号开头的短标签：※★◆○●×♯ 等开头的 ≤12 字符（游戏状态/属性标签）
+        #    含假名的要翻译（如 ●デバッグメニュー→调试菜单），不跳过
+        if len(t) <= 12 and t[0] in '※★◆○●◎×☆♯♭♪→←↑↓＋＋+' and \
+           not re.search(r'[\u3040-\u30ff]', t):
+            return True
+        # 10. 汉字+单假名且假名在末尾的短词（如 衣服ア），≤6字符；
+        #     仅当尾部假名是片假名标记（ア/ィ等分类符）才跳过；
+        #     平假名词尾(微笑み/驚き/怒り/舌出し)是真实日文词，必须翻译
+        if len(t) <= 6 and re.search(r'[\u4e00-\u9fff]', t):
+            _kana_list = re.findall(r'[\u3040-\u30ff]', t)
+            if len(_kana_list) == 1 and t.endswith(_kana_list[0]) and \
+               re.match(r'[\u30a0-\u30ff]', _kana_list[0]):
+                return True
+        # 11. 日文引号包裹的短词（如 「要救助者。）无假名则跳过；含假名(「ありがとう」)不跳过
+        if len(t) <= 12 and t.startswith('「') and not re.search(r'[\u3040-\u30ff]', t):
+            return True
+        # 12. 状态增减/数值标签：含 + 或 (数字) 的短文本（如 商人+1 / 金UP(10000) / 通常射精(3ml)）
+        #     无连续假名（有则可能是真句子），≤15字符
+        if len(t) <= 15 and not re.search(r'[\u3040-\u30ff]{2,}', t) and \
+           ('+' in t or re.search(r'[（(]\d+[a-zA-Z]*[)）]', t)):
+            return True
         return False
+
 
     def _translate_one(self, text, translator, src, tgt):
         if not text or not text.strip():
             return text
+        # 固定术语表注入（DeepSeek前缀缓存增强, 幂等；非OpenAI兼容引擎设了也无害）
+        if not hasattr(translator, '_glossary'):
+            translator._glossary = self._glossary_text
         # 不需要翻译的文本（纯数字、URL、路径、邮箱、占位符等）直接返回原文，不调用API
         if self._should_skip_translation(text):
             return text
+        # embedding 智能识别免翻内容（独立开关，勾选才调本地embedding；识别类似资源名/代码/内部名的文本自动跳过）
+        # 优先查本次翻译的批量扫描结果（_embed_skip_map），未在表中才实时调用
+        if self.embed_skip_enable.get():
+            if text in self._embed_skip_map:
+                if self._embed_skip_map[text]:
+                    return text
+            elif self._embedding_should_skip(text):
+                return text
         # 翻译缓存：相同文本+语言方向直接返回，避免重复翻译（游戏UI文本重复率高）
         cache_key = f"{src}|{tgt}|{text}"
         if cache_key in self.translation_cache:
@@ -2712,25 +3392,25 @@ class TranslatorApp:
                     if result:
                         return result
                     # 返回空视为失败
-                    self.errors += 1
-                    if self.errors <= 20:
+                    self._attempt_errors += 1
+                    if self._attempt_errors <= 20:
                         text_preview = t[:80].replace('\n', '\\n')
-                        self._log(f"失败({self.errors}) [empty]: 模型返回空 | 文本: {text_preview}")
+                        self._log(f"失败({self._attempt_errors}) [empty]: 模型返回空 | 文本: {text_preview}")
                     return t
                 except Exception as e:
                     err_type = self._classify_error(e)
                     # 授权错误不重试（重试也没用）
                     if err_type == 'auth':
-                        self.errors += 1
+                        self._attempt_errors += 1
                         self._log(f"授权失败，跳过: {str(e)[:80]}")
                         return t
                     if attempt >= max_retry:
-                        self.errors += 1
+                        self._attempt_errors += 1
                         # 记录前20条失败原因，便于排查（包含文本预览和错误类型）
-                        if self.errors <= 20:
+                        if self._attempt_errors <= 20:
                             text_preview = t[:80].replace('\n', '\\n')
                             err_detail = str(e) if str(e) else type(e).__name__
-                            self._log(f"失败({self.errors}) [{err_type}]: {err_detail[:150]} | 文本: {text_preview}")
+                            self._log(f"失败({self._attempt_errors}) [{err_type}]: {err_detail[:150]} | 文本: {text_preview}")
                         return t
                     # 指数退避 + 随机抖动：避免多线程同时苏醒同时重试（雷鸣群效应）
                     # 本地模型不搞指数退避，立即重试
@@ -2768,6 +3448,7 @@ class TranslatorApp:
                         translator.context = translator.context[-10:]
             final = result if result and result != text else text
             self.translation_cache[cache_key] = final
+            self._maybe_save_cache()
             return final
 
         protected, mapping = self._protect_text(text)
@@ -2785,7 +3466,34 @@ class TranslatorApp:
                 translator.context = translator.context[-10:]
         # 存入缓存
         self.translation_cache[cache_key] = result
+        self._maybe_save_cache()
         return result
+
+    def _load_translation_cache(self):
+        """启动时加载持久化翻译缓存（跨会话复用, 减少重复API调用/省钱）"""
+        try:
+            if os.path.exists(self._cache_file):
+                with open(self._cache_file, "r", encoding="utf-8") as f:
+                    _c = json.load(f)
+                if isinstance(_c, dict) and _c:
+                    self.translation_cache = _c
+                    self._log(f"📦 已加载 {len(_c)} 条持久化翻译缓存（跨会话复用）")
+        except Exception:
+            pass
+
+    def _save_translation_cache(self):
+        """保存翻译缓存到磁盘"""
+        try:
+            with open(self._cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.translation_cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _maybe_save_cache(self):
+        """节流保存：每 200 条新增写一次磁盘, 避免每条都写"""
+        self._cache_dirty += 1
+        if self._cache_dirty % 200 == 0:
+            self._save_translation_cache()
 
     def _start_translate(self):
         inf = self.input_file.get()
@@ -2816,6 +3524,8 @@ class TranslatorApp:
         self.is_paused = False
         self.count = 0
         self.errors = 0
+        self._done_entries = 0
+        self._attempt_errors = 0
         self.translated_chars = 0
         self.start_time = time.time()
         # 开始翻译：重置所有引擎的背压状态（避免上次翻译的冷却残留）
@@ -2829,9 +3539,10 @@ class TranslatorApp:
             with open(pf, 'r', encoding='utf-8') as f:
                 self.translated = json.load(f)
             # 修复：过滤掉值等于原文的条目（这些是之前翻译失败返回原文的，需要重新翻译）
+            # 例外：原文本身是代码/样式/乱码的保留原文条目是预期结果，不回炉重翻
             before_count = len(self.translated)
             self.translated = {k: v for k, v in self.translated.items()
-                              if v != k or self._should_skip_translation(k)}
+                              if v != k or self._should_skip_translation(k) or self._is_code_or_noise(k)}
             filtered = before_count - len(self.translated)
             if filtered > 0:
                 self._log(f"加载已有翻译: {before_count} 条，过滤掉 {filtered} 条返回原文的失败条目，剩余 {len(self.translated)} 条有效")
@@ -2853,7 +3564,77 @@ class TranslatorApp:
             self.is_running = False
             return
 
+        # === Unity 特征码识别：命中则启用 Unity 专属乱码跳过模式 ===
+        self._file_meta = None
+        self._unity_skip_mode = False
+        if isinstance(data, dict):
+            self._file_meta = data.pop('_mtool_meta', None)
+            if self._file_meta and isinstance(self._file_meta, dict) and self._file_meta.get('engine') == 'unity':
+                self._unity_skip_mode = True
+                self._log("✅ 识别到 Unity 提取文件特征码 → 启用 Unity 专属乱码跳过模式")
+            else:
+                # 兜底：旧版提取无特征码，但含明显 Unity 资源特征 key 也判定为 Unity
+                unity_hint = [k for k in data if isinstance(k, str) and
+                              (k.startswith('library/') or k.startswith('resources/')
+                               or k.endswith('.assets') or k.endswith('.resS')
+                               or k.endswith('unity_builtin_extra'))]
+                if len(unity_hint) >= 3:
+                    self._unity_skip_mode = True
+                    self._log(f"检测到 {len(unity_hint)} 个 Unity 资源特征 key（旧版提取无特征码）→ 启用 Unity 专属乱码跳过模式")
+                # 兜底2: Utage/Adv 引擎类名（Unity ADV 引擎特征, 大量出现必为 Unity）
+                if not self._unity_skip_mode:
+                    utage_hint = [k for k in data if isinstance(k, str) and
+                                  (k.startswith('Adv') or k.startswith('Utage'))]
+                    if len(utage_hint) >= 20:
+                        self._unity_skip_mode = True
+                        self._log(f"检测到 {len(utage_hint)} 个 Utage/Adv 引擎类名（Unity ADV 特征）→ 启用 Unity 专属乱码跳过模式")
+        if self._unity_skip_mode:
+            self._log("提示：Unity 专属模式将跳过二进制乱码/资源名/路径等非游戏文本（识别为垃圾的条目不会翻译）")
+
         to_translate = [k for k in data if k not in self.translated]
+        # 过滤跳过项（Unity 乱码/资源名/路径等非游戏文本），直接保留原文不进翻译队列
+        # 避免 14400+ 条垃圾挤爆请求 → 谷歌限流 429 → 连累真实日文一起失败
+        if to_translate:
+            skippable = [k for k in to_translate if self._should_skip_translation(k)]
+            if skippable:
+                for k in skippable:
+                    self.translated[k] = k
+                self._log(f"⏭ 跳过 {len(skippable)} 条非游戏文本（Unity乱码/资源名/路径等），直接保留原文不翻译")
+                to_translate = [k for k in to_translate if k not in self.translated]
+        # ===== embedding 智能免翻扫描（后台线程执行, 不阻塞GUI）=====
+        # 顺序：规则层过滤 → embedding批量扫描 → LLM翻译。扫描结果存入 _embed_skip_map，
+        # 逐条翻译时查表直接跳过，避免每条重复调用embedding。
+        if self.embed_skip_enable.get() and to_translate:
+            self._log(f"🧠 embedding智能免翻扫描: 待扫 {len(to_translate)} 条（模型: {self.semantic_model.get()}）…")
+            threading.Thread(target=self._embed_scan_and_start,
+                             args=(to_translate, data, src, tgt, use_engine_b), daemon=True).start()
+            return
+        self._start_translate_phase2(to_translate, data, src, tgt, use_engine_b)
+
+
+
+    def _embed_scan_and_start(self, to_translate, data, src, tgt, use_engine_b):
+        """embedding 智能免翻扫描（后台线程执行, 不阻塞GUI）。扫描完成后自动进入翻译阶段"""
+        try:
+            self._embed_skip_map = {}
+            embed_skippable = []
+            for k in dict.fromkeys(to_translate):
+                skip = self._embedding_should_skip(k)
+                self._embed_skip_map[k] = skip
+                if skip:
+                    embed_skippable.append(k)
+            if embed_skippable:
+                for k in embed_skippable:
+                    self.translated[k] = k
+                self._log(f"🧠 embedding智能免翻: 跳过 {len(embed_skippable)} 条（资源名/代码/内部名，与剧情样本相似度低于阈值 {self.embed_skip_threshold.get()}）")
+                to_translate = [k for k in to_translate if k not in self.translated]
+            else:
+                self._log("🧠 embedding智能免翻: 扫描完成，未发现可跳过条目")
+        except Exception as e:
+            self._log(f"⚠ embedding智能免翻扫描异常: {e}")
+        self._start_translate_phase2(to_translate, data, src, tgt, use_engine_b)
+
+    def _start_translate_phase2(self, to_translate, data, src, tgt, use_engine_b):
         self.to_translate = to_translate  # 保存供结束时统计实际失败数
         self.total_chars = sum(len(k) for k in to_translate)
         self._log(f"总条目: {len(data)}, 已翻译: {len(self.translated)}, 待翻译: {len(to_translate)}")
@@ -2886,53 +3667,96 @@ class TranslatorApp:
             threading.Thread(target=self._run_translate, args=(to_translate, data, src, tgt), daemon=True).start()
 
     def _parse_batch_result(self, raw_output, expected_count):
-        """解析LLM批量翻译输出，返回译文列表，失败返回None。支持多种编号格式和Markdown。"""
+        """解析LLM批量翻译输出，返回译文列表，失败返回None。支持多种编号格式和Markdown。
+        兼容模型输出"原文：xxx"+"精修后译文：yyy"的双标签多行块格式（此时取译文标签后的内容）。"""
         if not raw_output:
             return None
         # 预处理：移除Markdown代码块标记
         text = raw_output
         text = re.sub(r'```[\w]*\n?', '', text)
         text = text.replace('```', '')
-        # 按行解析，支持多种编号格式：1. 1、1) 1：1- 1] 1】等
-        results = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            # 格式1: 1. 译文 / 1、译文 / 1)译文 等
-            m = re.match(r'^\s*(\d+)\s*[\.\、\):：\-\]】]\s*(.+)$', line)
-            # 格式2: 编号: 1 译文: xxx / 序号: 1 翻译: xxx
-            if not m:
-                m = re.match(r'^(?:编号|序号|No\.?)\s*[:：.\-]?\s*(\d+)\s*(?:译文|翻译|translated)?\s*[:：.\-]?\s*(.+)$', line, re.IGNORECASE)
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+        # 按编号行切块：块 = 编号行 + 其后的所有非编号行（直到下一个编号行）
+        num_re = re.compile(r'^(\d+)\s*[\.\、\):：\-\]】]\s*(.*)$')
+        blocks = []  # [(idx, [内容行...])]
+        cur_idx, cur_lines = None, []
+        for line in lines:
+            m = num_re.match(line)
             if m:
-                idx = int(m.group(1))
-                content = m.group(2).strip()
+                if cur_idx is not None:
+                    blocks.append((cur_idx, cur_lines))
+                cur_idx = int(m.group(1))
+                cur_lines = [m.group(2)]
+            else:
+                if cur_idx is not None:
+                    cur_lines.append(line)
+                else:
+                    cur_idx = len(blocks) + 1
+                    cur_lines = [line]
+        if cur_idx is not None:
+            blocks.append((cur_idx, cur_lines))
+
+        def _extract_block(blines):
+            """从块内提取译文。标签优先级：精修后译文/译文/翻译 > 初译(模型可能用初译标签输出译文) > 无标签取首个非原文行"""
+            for line in blines:
+                m = re.match(r'^(?:精修后译文|译文|翻译|translated|translation)\s*[:：]\s*(.+)$', line, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
+            # 模型有时用"初译："标签输出精修结果（从后往前取最后一个标签行）
+            for line in reversed(blines):
+                m = re.match(r'^(?:初译|译文|翻译)\s*[:：]\s*(.+)$', line, re.IGNORECASE)
+                if m:
+                    return m.group(1).strip()
+            # 无标签：取第一个非"原文/源文本"前缀的行
+            for line in blines:
+                if re.match(r'^(?:原文|原文文本|源文本)[：:]', line):
+                    continue
+                return line
+            return None
+
+        results = {}
+        for idx, blines in blocks:
+            content = _extract_block(blines)
+            if content:
                 # 移除可能的引号包裹
                 if (content.startswith('"') and content.endswith('"')) or \
                    (content.startswith('"') and content.endswith('"')) or \
                    (content.startswith("'") and content.endswith("'")):
                     content = content[1:-1].strip()
-                while len(results) < idx - 1:
-                    results.append(None)
-                if len(results) == idx - 1:
-                    results.append(content)
-                elif idx - 1 < len(results):
-                    results[idx - 1] = content
-                else:
-                    results.append(content)
-        # 检查数量
-        valid = [r for r in results if r is not None]
+                results[idx] = content
+        valid = [results[i] for i in sorted(results) if results[i]]
         if len(valid) == expected_count:
             return valid
+        # 兼容旧的按行解析（无"译文"标签、单行"编号. 内容"）
+        results_old = []
+        for line in lines:
+            m = num_re.match(line)
+            if m:
+                idx = int(m.group(1))
+                content = m.group(2).strip()
+                while len(results_old) < idx - 1:
+                    results_old.append(None)
+                if len(results_old) == idx - 1:
+                    results_old.append(content)
+                elif idx - 1 < len(results_old):
+                    results_old[idx - 1] = content
+                else:
+                    results_old.append(content)
+        valid_old = [r for r in results_old if r is not None]
+        if len(valid_old) == expected_count:
+            return valid_old
         # 按行解析失败，尝试按空行分隔（无编号的情况）
-        if len(valid) == 0:
-            blocks = re.split(r'\n\s*\n', text.strip())
-            blocks = [b.strip() for b in blocks if b.strip()]
-            if len(blocks) == expected_count:
-                return blocks
+        if len(valid_old) == 0:
+            blocks_plain = re.split(r'\n\s*\n', text.strip())
+            blocks_plain = [b.strip() for b in blocks_plain if b.strip()]
+            if len(blocks_plain) == expected_count:
+                return blocks_plain
         # 编号不连续但数量够，尝试按出现顺序返回
         if len(valid) >= expected_count:
             return valid[:expected_count]
+        if len(valid_old) >= expected_count:
+            return valid_old[:expected_count]
         return None
 
     def _translate_batch_worker(self, batch, translator, src, tgt):
@@ -2949,6 +3773,8 @@ class TranslatorApp:
             if self.should_stop:
                 return []
             try:
+                if not hasattr(translator, '_glossary'):
+                    translator._glossary = self._glossary_text
                 raw = translator.translate_batch(protected_batch, src, tgt)
                 # 传统引擎返回列表，LLM引擎返回带编号字符串
                 if isinstance(raw, list):
@@ -3027,6 +3853,38 @@ class TranslatorApp:
             translator = self._get_translator()
             engine_name = self.api_engine.get()
             workers = self.max_workers.get()
+            # DeepSeek 缓存构建是 best-effort 且需要一定时间；过高并发会同时制造多个首请求。
+            # 这里仅对明确识别为 DeepSeek 的 OpenAI-compatible 配置做缓存友好限并发。
+            if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+                requested_workers = workers
+                workers = min(max(1, workers), 4)
+                if requested_workers != workers:
+                    self._log(f"DeepSeek缓存优化：并发 {requested_workers} → {workers}，减少冷前缀同时构建")
+
+        # 整个翻译任务固定同一份术语表，预热必须使用与正式请求完全一致的前缀。
+        if hasattr(translator, '_glossary') is False:
+            translator._glossary = self._glossary_text
+        self._active_cache_translators = [translator] if isinstance(translator, OpenAICompatTranslator) else []
+        if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+            try:
+                import hashlib as _hashlib
+                task_material = "|".join([
+                    os.path.abspath(self.input_file.get() or ""),
+                    src, tgt, translator.model, translator._build_static_prefix()
+                ])
+                task_key = "mtool-" + _hashlib.sha256(task_material.encode("utf-8")).hexdigest()[:32]
+                translator.set_cache_identity(task_key)
+                self._log(f"DeepSeek缓存身份：{"TokenHub" if translator._is_tokenhub() else "DeepSeek"} / key={task_key[:18]}…")
+            except Exception as _e:
+                self._log(f"⚠ 设置Prompt Cache身份失败：{_e}")
+            try:
+                self.cache_warmup_var.set("预热：正在自动建立固定前缀缓存…")
+                ok, msg = translator.warmup_cache(src, tgt)
+                self.cache_warmup_var.set(("预热：成功 · " if ok else "预热：失败 · ") + msg)
+                self._log(("✅ " if ok else "⚠ ") + "DeepSeek自动缓存预热：" + msg)
+            except Exception as e:
+                self.cache_warmup_var.set(f"预热：失败 · {str(e)[:120]}")
+                self._log(f"⚠ DeepSeek自动缓存预热异常：{e}")
 
         # Ollama本地模型预热：提前加载模型到内存，避免第一条翻译因加载超时
         if engine_name == "Ollama本地模型" and hasattr(translator, 'warmup'):
@@ -3044,10 +3902,23 @@ class TranslatorApp:
 
         # 判断是否启用批量翻译（引擎支持且batch_size>0，Ollama本地模型禁用批量避免卡住）
         is_ollama = getattr(translator, 'name', '') == 'Ollama本地模型'
+        is_gateway = getattr(translator, 'name', '') == '浏览器网关(网页版AI)'
         use_batch = getattr(translator, 'supports_batch', False) and self.batch_size.get() > 0 and not is_ollama
         if use_batch:
-            bs = min(self.batch_size.get(), 6)  # 强制上限6条，限速环境下宁小勿大
-            max_chars = 2000  # 每批最大字符数（严禁超过3000，避免单条请求拖死并发槽位）
+            if is_gateway:
+                # 网页版AI网关：1并发串行。实测 DeepSeek 网页版单批≤10条最稳（30条/批后半段输出被截断缺失、
+                # 10条/批 100% 完整返回），故固定 10 条/批；同时保持较少发送次数不易限流。
+                bs = min(self.batch_size.get(), 10)
+                if bs < 1:
+                    bs = 10
+                max_chars = 5000  # 网页输入框可容纳较长文本；超长自动分包
+            else:
+                # 在线 OpenAI-compatible LLM：适当增大批次以减少请求次数，并保持较长公共前缀。
+                # DeepSeek 推荐优先测试 8~12 条/批；总字符数控制在 4000 左右。
+                bs = min(self.batch_size.get(), 12)
+                if bs < 1:
+                    bs = 10
+                max_chars = 4000
             # 动态分批：短文本按字符数合并，长文本(>500字)单独翻译
             tasks = []
             short_texts = []
@@ -3096,9 +3967,8 @@ class TranslatorApp:
                     break
                 elapsed_since_progress = time.time() - last_progress_time[0]
                 if elapsed_since_progress > 60 and last_done[0] > 0:
-                    # 判断是否本地模型，本地模型不说API限流
-                    base_local = self.base_url.get().lower()
-                    is_local_model = 'localhost:11434' in base_local or '127.0.0.1:11434' in base_local or self.api_engine.get() == 'Ollama本地模型'
+                    # 按实际翻译引擎判断，本地模型不说API限流
+                    is_local_model = getattr(translator, 'name', '') == 'Ollama本地模型'
                     if is_local_model:
                         self._log(f"⚠ 已 {int(elapsed_since_progress)}秒无新进度，本地模型响应慢或GPU占用高，正在继续处理...")
                     else:
@@ -3118,8 +3988,17 @@ class TranslatorApp:
                     results = future.result()
                     for text, result in results:
                         if result:
-                            # 修复：结果等于原文且非跳过类型时，视为翻译失败（不写入translated，进入重试）
-                            if result == text and not self._should_skip_translation(text):
+                            # Unity 模式：返回原文直接保留（不再判失败/重试）——Unity 文件里翻不动的
+                            # 条目本来就是"保留原文"，避免 429 限流下大量重试拖慢 + 误报失败
+                            if result == text and self._unity_skip_mode:
+                                with lock:
+                                    self.translated[text] = result
+                                    self.count += 1
+                                    self.translated_chars += len(text)
+                                continue
+                            # 非Unity模式：正常文本返回原文 → 翻译失败（不写入translated，进入重试）；
+                            # 原文本身是代码/样式/乱码 → LLM原样返回属预期，直接保留原文不算失败
+                            if result == text and not self._should_skip_translation(text) and not self._is_code_or_noise(text):
                                 self.errors += 1
                                 if self.errors <= 20:
                                     text_preview = text[:80].replace('\n', '\\n')
@@ -3131,14 +4010,18 @@ class TranslatorApp:
                                 self.translated_chars += len(text)
                 except Exception:
                     self.errors += 1
+                task = futures[future]
+                task_type, payload = task
                 done += 1
-                last_done[0] = done
+                completed_here = len(payload) if task_type == 'batch' else 1
+                self._done_entries += completed_here
+                last_done[0] = self._done_entries
                 last_progress_time[0] = time.time()
-                if done % 5 == 0 or done == len(tasks):
+                if done % 2 == 0 or done == len(tasks):
                     elapsed = time.time() - start_time
-                    rate = self.count / elapsed if elapsed > 0 else 0
-                    remain = (total_entries - self.count) / rate if rate > 0 else 0
-                    self.root.after(0, self._update_progress, self.count, total_entries, rate, remain)
+                    rate = self._done_entries / elapsed if elapsed > 0 else 0
+                    remain = max(0, total_entries - self._done_entries) / rate if rate > 0 else 0
+                    self.root.after(0, self._update_progress, self._done_entries, total_entries, rate, remain)
                 if self.count % 200 == 0:
                     self._save_progress()
 
@@ -3147,17 +4030,26 @@ class TranslatorApp:
         # 失败流转：因限流/超时失败的条目，改用2线程低并发重试（快车不受慢车拖累）
         failed = [text for text in to_translate if text not in self.translated]
         if failed and not self.should_stop:
-            # 判断是否本地模型（Ollama），本地模型无限流，不需要等待
-            base_local = self.base_url.get().lower()
-            is_local_model = 'localhost:11434' in base_local or '127.0.0.1:11434' in base_local
+            # 过滤出真正值得重试的（路径/编号标签等跳过项直接保留原文，不浪费本地模型资源）
+            skippable = [text for text in failed if self._should_skip_translation(text)]
+            if skippable:
+                with lock:
+                    for text in skippable:
+                        self.translated[text] = text
+                        self.count += 1
+                        self.translated_chars += len(text)
+                self._log(f"【失败流转】{len(skippable)} 条为路径/编号标签，直接保留原文不重试")
+            failed = [text for text in failed if text not in self.translated]
+        if failed and not self.should_stop:
+            # 判断实际重试引擎是否本地模型（Ollama），本地模型无限流，不需要等待
+            # 注意：按实际 translator 判断，不能按 API 设置页的 base_url（精修模式第一阶段可能是谷歌）
+            is_local_model = getattr(translator, 'name', '') == 'Ollama本地模型'
             if is_local_model:
-                self._log(f"【失败流转】{len(failed)} 条失败，本地模型直接重试...")
+                self._log(f"【失败流转】{len(failed)} 条失败，本地模型(Ollama)直接重试...")
             else:
-                # 谷歌翻译限流窗口更长（几分钟），冷却加倍到60秒
-                is_google = self.api_engine.get() == "谷歌翻译(免费)"
-                cooldown = 60 if is_google else 30
-                self._log(f"【失败流转】{len(failed)} 条因限流/超时失败，等待{cooldown}秒让限流窗口过去...")
-                for _ in range(cooldown):
+                # 大批量失败多为限流/超时：先等30秒让限流窗口过去，否则低并发重试也会继续吃429
+                self._log(f"【失败流转】{len(failed)} 条因限流/超时失败，等待30秒让限流窗口过去...")
+                for _ in range(30):
                     if self.should_stop:
                         break
                     time.sleep(1)
@@ -3173,6 +4065,8 @@ class TranslatorApp:
                             results = future.result()
                             for text, result in results:
                                 if result:
+                                    if result == text and not self._should_skip_translation(text) and not self._is_code_or_noise(text):
+                                        continue
                                     with lock:
                                         self.translated[text] = result
                                         self.count += 1
@@ -3196,12 +4090,29 @@ class TranslatorApp:
 
         self._save_output(data)
 
-        # 第二阶段：LLM精修
+        # 第二阶段：翻译校准 → 第三阶段：LLM精修（校准在前、精修在后）
         if self.refine_mode.get() and not self.should_stop:
-            self.root.after(0, lambda: self.status_label.config(text="进入第二阶段：评估译文质量并精修..."))
-            self._log("=== 第二阶段：LLM精修开始 ===")
-            self._run_refine_phase(data, src, tgt)
+            self._run_calibrate_then_refine(data, src, tgt)
             self._save_output(data)
+
+        # DeepSeek缓存命中报告（OpenAI兼容引擎自动统计usage.prompt_cache_hit_tokens）
+        _stats = getattr(translator, '_cache_stats', None)
+        if _stats and (_stats.get('hit') or _stats.get('miss')):
+            _tot = _stats['hit'] + _stats['miss']
+            _pct = _stats['hit'] * 100.0 / _tot if _tot else 0.0
+            self._log(f"💾 Prompt缓存: 命中 {_stats['hit']:,} tokens / 未命中 {_stats['miss']:,} tokens / 命中率 {_pct:.1f}%")
+            cache_report = self._deepseek_cache_cost(_stats)
+            cost_line = self._format_cache_cost_report(cache_report)
+            if cost_line:
+                self._log(cost_line)
+            self._log("   缓存优化：固定System+规则+术语表+语言方向保持不变；DeepSeek关闭滚动上下文；批量与并发控制优先复用长前缀。")
+        # 保存最近一轮缓存统计，供完成提示、详细报告和费用估算使用
+        raw_stats = getattr(translator, '_cache_stats', None)
+        if len(getattr(self, '_active_cache_translators', []) or []) > 1:
+            self.last_cache_stats = self._aggregate_cache_stats()
+        else:
+            self.last_cache_stats = dict(raw_stats) if raw_stats else None
+        self._save_translation_cache()
 
         self.root.after(0, self._finish)
 
@@ -3219,6 +4130,33 @@ class TranslatorApp:
         """双引擎并行翻译：奇偶分片，两个线程池同时跑"""
         translator_a = self._get_translator()
         translator_b = self._get_translator_b()
+        for translator in (translator_a, translator_b):
+            if isinstance(translator, OpenAICompatTranslator):
+                translator._glossary = self._glossary_text
+        self._active_cache_translators = [t for t in (translator_a, translator_b) if isinstance(t, OpenAICompatTranslator)]
+        # 双引擎必须共享同一个 cache identity，避免 A/B 各自产生冷缓存。
+        try:
+            import hashlib as _hashlib
+            task_material = "|".join([
+                os.path.abspath(self.input_file.get() or ""), src, tgt,
+                self._glossary_text or "", translator_a.model, translator_b.model
+            ])
+            shared_key = "mtool-" + _hashlib.sha256(task_material.encode("utf-8")).hexdigest()[:32]
+            for _t in self._active_cache_translators:
+                _t.set_cache_identity(shared_key)
+            self._log(f"双引擎共享Prompt Cache身份：{shared_key[:18]}…")
+        except Exception as _e:
+            self._log(f"⚠ 双引擎设置Prompt Cache身份失败：{_e}")
+        for label, translator in (("A", translator_a), ("B", translator_b)):
+            if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+                try:
+                    self.cache_warmup_var.set(f"预热：正在预热引擎{label}…")
+                    ok, msg = translator.warmup_cache(src, tgt)
+                    self._log(("✅ " if ok else "⚠ ") + f"DeepSeek引擎{label}自动缓存预热：" + msg)
+                except Exception as e:
+                    self._log(f"⚠ DeepSeek引擎{label}自动缓存预热异常：{e}")
+        if any(isinstance(t, OpenAICompatTranslator) and t._is_deepseek() for t in self._active_cache_translators):
+            self.cache_warmup_var.set("预热：自动预热已执行")
 
         workers_a = self.max_workers.get()
         workers_b = self.engine_b_workers.get()
@@ -3377,20 +4315,20 @@ class TranslatorApp:
                     self._save_progress()
 
         self._save_progress()
+        if self._active_cache_translators:
+            self.last_cache_stats = self._aggregate_cache_stats()
 
         # 失败流转：任一引擎失败的条目，用主引擎低并发重试
         failed = [text for text in to_translate if text not in self.translated]
         if failed and not self.should_stop:
-            # 判断是否本地模型（Ollama），本地模型无限流，不需要等待
-            base_a = self.base_url.get().lower()
-            is_local = 'localhost:11434' in base_a or '127.0.0.1:11434' in base_a
+            # 按实际主引擎判断是否本地模型（Ollama），本地模型无限流，不需要等待
+            is_local = getattr(translator_a, 'name', '') == 'Ollama本地模型'
             if is_local:
-                self._log(f"【失败流转】{len(failed)} 条失败，本地模型直接重试...")
+                self._log(f"【失败流转】{len(failed)} 条失败，本地模型(Ollama)直接重试...")
             else:
-                is_google = self.api_engine.get() == "谷歌翻译(免费)"
-                cooldown = 60 if is_google else 30
-                self._log(f"【失败流转】{len(failed)} 条失败，等待{cooldown}秒让限流窗口过去...")
-                for _ in range(cooldown):
+                # 大批量失败多为限流/超时：先等30秒让限流窗口过去，否则低并发重试也会继续吃429
+                self._log(f"【失败流转】{len(failed)} 条因限流/超时失败，等待30秒让限流窗口过去...")
+                for _ in range(30):
                     if self.should_stop:
                         break
                     time.sleep(1)
@@ -3417,11 +4355,9 @@ class TranslatorApp:
 
         self._save_output(data)
 
-        # 精修阶段
+        # 精修阶段（校准在前、精修在后）
         if self.refine_mode.get() and not self.should_stop:
-            self.root.after(0, lambda: self.status_label.config(text="进入第二阶段：评估译文质量并精修..."))
-            self._log("=== 第二阶段：LLM精修开始 ===")
-            self._run_refine_phase(data, src, tgt)
+            self._run_calibrate_then_refine(data, src, tgt)
             self._save_output(data)
 
         self.root.after(0, self._finish)
@@ -3435,7 +4371,7 @@ class TranslatorApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        ttk.Label(dlg, text="用本地Ollama的embedding API检测术语翻译错误（如神殿→寺庙）",
+        ttk.Label(dlg, text="用本地Ollama的embedding API检测术语翻译错误（如 Good luck 误译为“再见了”）",
                   font=("微软雅黑", 10, "bold"), wraplength=580).pack(padx=15, pady=(15, 10), anchor=tk.W)
 
         # Ollama地址
@@ -3470,11 +4406,12 @@ class TranslatorApp:
             "2. 同时计算汉字匹配度（日语汉字归一化为简体后对比）\n"
             "3. 最终相似度 = embedding相似度 × (0.5 + 0.5 × 汉字匹配度)\n"
             "   汉字完全匹配时不扣分，完全不匹配时额外扣50%\n"
-            "   例：神殿→寺庙，embedding可能相似，但汉字匹配度低，最终分数降低被检出\n\n"
+            "   说明：汉字匹配度只能抓\"汉字对不上\"的错误；对\"原文无汉字\"或\n"
+            "   \"汉字全对但语义错\"（如英文原文误译、同形异义）只能靠embedding语义判定\n\n"
             "【使用步骤】\n"
             "1. 安装Ollama：https://ollama.com ，启动后执行 ollama serve\n"
-            "2. 拉取embedding模型：ollama pull nomic-embed-text（约270MB，推荐）\n"
-            "   其他可选：ollama pull bge-m3（多语言，约1.2GB，质量更好）\n"
+            "2. 拉取embedding模型：ollama pull yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0（多语言，约90MB，已预装推荐）\n"
+            "   其他可选：ollama pull nomic-embed-text / bge-m3（多语言，约1.2GB，质量更好）\n"
             "3. 点击「获取模型」列出本地所有模型，选择embedding模型\n"
             "4. 点击「测试」验证配置是否正常\n"
             "5. 翻译完成后自动扫描所有条目，计算语义相似度\n"
@@ -3509,7 +4446,7 @@ class TranslatorApp:
                 data = json.loads(resp.read().decode('utf-8'))
                 models = [m.get('name', '') for m in data.get('models', []) if m.get('name')]
                 if not models:
-                    self.root.after(0, lambda: messagebox.showinfo("提示", "未找到本地模型，请先执行 ollama pull nomic-embed-text"))
+                    self.root.after(0, lambda: messagebox.showinfo("提示", "未找到本地模型，请先安装Ollama并拉取embedding模型（如 yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0）"))
                     return
                 # 优先embedding模型，然后其他模型
                 embed_models = [m for m in models if any(k in m.lower() for k in ['embed', 'nomic', 'bge', 'e5', 'mxbai', 'jina'])]
@@ -3536,36 +4473,58 @@ class TranslatorApp:
             if not messagebox.askyesno("提示", "翻译校准未启用，是否启用并测试？"):
                 return
             self.enable_semantic_check.set(True)
-        test_src = "神殿の入り口"
-        test_tgt_ok = "神殿入口"
-        test_tgt_bad = "寺庙入口"
+        # 测试样例：选"汉字匹配度失效、只能靠embedding区分"且无歧义的场景
+        # 原文为纯英文（无汉字），汉字匹配度对两个译文都是1.0不参与扣分，分数完全由embedding决定
+        test_src = "Good luck, my friend"
+        test_tgt_ok = "祝你好运，我的朋友"
+        test_tgt_bad = "再见了，我的敌人"
         self._log(f"正在测试语义校验: {test_src} → {test_tgt_ok} / {test_tgt_bad}")
         def run_test():
             try:
-                sim_ok = self._semantic_similarity(test_src, test_tgt_ok)
-                sim_bad = self._semantic_similarity(test_src, test_tgt_bad)
+                # 强制真实调用（不命中缓存），确保测试反映当前配置；模型未配置/无效时返回1.0会显示出来
+                sim_ok = self._semantic_similarity(test_src, test_tgt_ok, use_cache=False)
+                sim_bad = self._semantic_similarity(test_src, test_tgt_bad, use_cache=False)
                 threshold = self.semantic_threshold.get()
-                msg = (f"语义校验测试成功！\n\n"
-                       f"原文: {test_src}\n"
-                       f"正确译文: {test_tgt_ok} → 相似度 {sim_ok:.3f} {'✅通过' if sim_ok >= threshold else '❌误报'}\n"
-                       f"错误译文: {test_tgt_bad} → 相似度 {sim_bad:.3f} {'✅检出' if sim_bad < threshold else '❌漏检'}\n\n"
-                       f"当前阈值: {threshold}\n"
-                       f"结论: {'校验功能正常，能区分术语错误' if sim_ok > sim_bad else '校验效果不佳，建议换模型或调阈值'}")
+                # 检测"模型未真正生效"：两项都≈1.0，说明embedding调用失败/模型未配置/不是embedding模型
+                model_unavailable = sim_ok >= 0.999 and sim_bad >= 0.999
+                if model_unavailable:
+                    msg = (f"⚠ 语义校验未真正执行！\n\n"
+                           f"正确译文: {test_tgt_ok} → 相似度 {sim_ok:.3f}\n"
+                           f"错误译文: {test_tgt_bad} → 相似度 {sim_bad:.3f}\n\n"
+                           f"两项都是1.000，说明embedding没有被计算。\n"
+                           f"可能原因：\n"
+                           f"1. Embedding模型为空或未填写\n"
+                           f"2. 填的是翻译模型（如 hy-mt / qwen），不是embedding模型\n"
+                           f"3. Ollama未启动 或 模型未拉取\n\n"
+                           f"请使用embedding模型，如：\n"
+                           f"· yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0（已预装，推荐）\n"
+                           f"· nomic-embed-text  （ollama pull nomic-embed-text）\n"
+                           f"· bge-m3")
+                else:
+                    msg = (f"语义校验测试成功！\n\n"
+                           f"原文: {test_src}\n"
+                           f"正确译文: {test_tgt_ok} → 相似度 {sim_ok:.3f} {'✅通过' if sim_ok >= threshold else '❌误报'}\n"
+                           f"错误译文: {test_tgt_bad} → 相似度 {sim_bad:.3f} {'✅检出' if sim_bad < threshold else '❌漏检'}\n\n"
+                           f"当前阈值: {threshold}\n"
+                           f"结论: {'校验功能正常，能区分术语错误' if sim_ok > sim_bad else '校验效果不佳，建议换模型或调阈值'}")
                 self.root.after(0, lambda: messagebox.showinfo("测试结果", msg))
-                self._log(f"语义校验测试: 正确={sim_ok:.3f}, 错误={sim_bad:.3f}, 阈值={threshold}")
+                self._log(f"语义校验测试: 正确={sim_ok:.3f}, 错误={sim_bad:.3f}, 阈值={threshold}, 模型生效={not model_unavailable}")
             except Exception as e:
                 err_msg = str(e) if str(e) else "测试失败"
                 self._log(f"语义校验测试失败: {err_msg}")
-                self.root.after(0, lambda: messagebox.showerror("测试失败", f"语义校验测试失败：\n{err_msg}\n\n请检查Ollama是否启动、模型是否已拉取（ollama pull nomic-embed-text）。"))
+                self.root.after(0, lambda: messagebox.showerror("测试失败", f"语义校验测试失败：\n{err_msg}\n\n请检查Ollama是否启动、embedding模型是否已拉取（如 yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0）。"))
         threading.Thread(target=run_test, daemon=True).start()
 
     def _kanji_match_score(self, source, target):
         """计算汉字匹配度：原文汉字（归一化后）出现在译文中的比例。
         返回0-1，1表示所有原文汉字都在译文中，0表示完全不匹配。
-        原文无汉字时返回1.0（不影响打分）。"""
+        原文无汉字或汉字≤3时返回1.0（不扣分——短汉字词意译空间大，汉字匹配不可靠）。"""
         src_kanji = self._extract_kanji(source)
         if not src_kanji:
             return 1.0  # 原文无汉字，不影响
+        if len(src_kanji) <= 3:
+            # 原文汉字≤3（如 彼女優/戦場戦）：日译中常意译换字，汉字匹配不可靠，以embedding为准
+            return 1.0
         src_set = set(src_kanji)
         tgt_set = set(self._extract_kanji(target))
         if not src_set:
@@ -3574,16 +4533,118 @@ class TranslatorApp:
         matched = len(src_set & tgt_set)
         return matched / len(src_set)
 
-    def _semantic_similarity(self, text1, text2):
+    # ==================== embedding 智能识别免翻内容 ====================
+    # 剧情/自然语言样本：用来判断文本"像不像人话"——与剧情样本相似度低 → 判定为内部标识符/资源名免翻
+    EMBED_DIALOGUE_SAMPLES = [
+        "Hello, how are you", "Let's go to the store together", "I don't understand what you mean",
+        "Thank you very much for your help", "Are you ready to begin", "Wait, I need to think about this",
+        "What should we do now", "She smiled and looked at me", "Please tell me more about it",
+        "I have something important to tell you", "Do you want to go with me", "That's a great idea",
+        "I'm sorry, I can't do that", "Where did you come from", "Let me think about it",
+        "What happened here", "This place is really nice", "We need to find a way out",
+        "Can you help me with this", "I will be back soon", "You are not going to believe this",
+        "Give me a moment please", "It's getting dark outside", "We have to be careful",
+    ]
+
+    def _ollama_embed(self, text):
+        """调用Ollama /api/embeddings 返回单个文本的向量；失败返回None。"""
+        try:
+            base = self.semantic_ollama_url.get().rstrip('/')
+            model = self.semantic_model.get()
+            if not base or not model:
+                return None
+            import ssl as _ssl
+            import urllib.request as _req
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            opener = _req.build_opener(_req.ProxyHandler({}), _req.HTTPSHandler(context=ctx))
+            payload = json.dumps({"model": model, "prompt": text}).encode('utf-8')
+            req = _req.Request(f"{base}/api/embeddings", data=payload,
+                               headers={'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+            resp = opener.open(req, timeout=30)
+            data = json.loads(resp.read().decode('utf-8'))
+            return data.get('embedding') or None
+        except Exception:
+            return None
+
+    def _cos_sim(self, v1, v2):
+        import math
+        dot = sum(a * b for a, b in zip(v1, v2))
+        n1 = math.sqrt(sum(a * a for a in v1))
+        n2 = math.sqrt(sum(b * b for b in v2))
+        if n1 == 0 or n2 == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (n1 * n2)))
+
+    def _embedding_should_skip(self, text):
+        """embedding 智能识别免翻内容：与内置"剧情/自然语言"样本库算最大余弦相似度，
+        相似度低于阈值 → 判定为内部标识符/资源名/代码等非自然语言文本，自动跳过翻译。
+        仅当勾选「embedding智能识别免翻内容」且 embedding 配置有效时生效；失败一律返回False（不误伤）。"""
+        try:
+            t = text.strip()
+            # 太短（embedding区分度低，如 UI 短词 Save/OK）或过长（多为长句剧情）不做判断，交给规则/API
+            if len(t) < 7 or len(t) > 80:
+                return False
+            # 含中日韩/假名的文本属于真实游戏文本，不做免翻判断（除非规则已处理）
+            import re as _re
+            if _re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t):
+                return False
+            # 预筛：含明显乱码类非ASCII字符（西里尔/希腊/拉丁扩展特殊符号/上标等）→ 直接判乱码免翻。
+            # 但排除常见外语重音字符（á é ü ñ ç ß 等是正常文本，不能误伤法/德/西/葡）。
+            # 覆盖 ZWȴ-OBIr（ȴ）、H3tFǨ（Ǩ）等"字母+特殊符号"的临界乱码，
+            # 避免它们 embedding 相似度恰好越过阈值被误判为正常。
+            _misc = _re.findall(r'[^\x00-\x7f\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', t)
+            if _misc:
+                # 常见外语重音字母 + 外语标点（¿¡«» 是正常西/法语文本）+ 英文弯引号/破折号/省略号
+                # + 游戏常见装饰符号（♪♫♦♣♠•★☆○●◎× 等句尾/列表装饰）+ 方向箭头/颜文字/全角空格
+                _accents = "áàâäãåéèêëíìîïóòôöõúùûüýÿñçæœßøåāēīōū¿¡«»’‘“”…—–♥♡♪♫♣♦♠•★☆○●◎×↑←↓→·ʕᴥʔ\u3000"
+                if any(c not in _accents for c in _misc):
+                    return True
+            # 多词英文文本（空格分隔≥2词）→ 像自然语言句子/短语（剧情、设置项、选项），
+            # 不判免翻——避免 "Auto Text Settings" / 正常英文剧情被误杀。
+            # embedding只负责拦"单token代码/资源名/内部标识符"（如 m_TextureAtlasName）。
+            if len(t.split()) >= 2:
+                return False
+            base = self.semantic_ollama_url.get().rstrip('/')
+            model = self.semantic_model.get()
+            if not base or not model:
+                return False
+            # 剧情样本库向量缓存（只编码一次）
+            if self._embed_skip_vectors is None:
+                self._embed_skip_vectors = []
+                for s in self.EMBED_DIALOGUE_SAMPLES:
+                    v = self._ollama_embed(s)
+                    if v:
+                        self._embed_skip_vectors.append(v)
+                if not self._embed_skip_vectors:
+                    return False
+            # 剥离占位符/标记后再判断（Hello {name} → Hello X）：避免带占位符的正常对话
+            # （如 "Hello {name}, welcome back"）被 embedding 当成代码/内部名误判为免翻。
+            # 剥离后过短（多为纯占位符/标记）→ 交给规则层处理。
+            plain = _re.sub(r'\{[^}]*\}|%[sdif]\$?[a-zA-Z_]*|\[[a-zA-Z_][a-zA-Z0-9_]*\]|<[^>]+>', 'X', t).strip()
+            if len(plain) < 7:
+                return False
+            vec = self._ollama_embed(plain)
+            if not vec:
+                return False
+            best = max(self._cos_sim(vec, v) for v in self._embed_skip_vectors)
+            # 与剧情样本相似度低于阈值 → 不像自然语言 → 免翻
+            return best < self.embed_skip_threshold.get()
+        except Exception:
+            return False
+
+    def _semantic_similarity(self, text1, text2, use_cache=True):
         """用Ollama embedding API计算两段文本的余弦相似度，返回0-1。
-        结合汉字匹配度：汉字不匹配的条目会被额外扣分。"""
+        结合汉字匹配度：汉字不匹配的条目会被额外扣分。
+        use_cache=False 时强制真实调用（测试用），避免命中旧缓存造成"模型没配置还能成功"的假象。"""
         cache_key = f"{text1}|||{text2}"
-        if cache_key in self._semantic_cache:
-            return self._semantic_cache[cache_key]
         base = self.semantic_ollama_url.get().rstrip('/')
         model = self.semantic_model.get()
         if not base or not model:
             return 1.0  # 配置缺失时返回1.0（不扣分）
+        if use_cache and cache_key in self._semantic_cache:
+            return self._semantic_cache[cache_key]
         try:
             import urllib.request as _req
             ctx = ssl.create_default_context()
@@ -3612,11 +4673,11 @@ class TranslatorApp:
                 return 1.0
             sim = dot / (norm1 * norm2)
             sim = max(0.0, min(1.0, sim))
-            # 结合汉字匹配度：汉字不匹配的额外扣分
-            # 最终相似度 = embedding相似度 × (0.5 + 0.5 × 汉字匹配度)
-            # 汉字完全匹配时不扣分，完全不匹配时扣50%
+            # 结合汉字匹配度：加权平均（embedding为主0.75，汉字匹配为辅0.25）
+            # 修复：原乘法砍半(×0.5+0.5×kanji)会把embedding高分误杀(如日译中换字)，导致大量误报
+            # 现改为加权平均，embedding语义正确即高分，汉字匹配只作辅助线索
             kanji_score = self._kanji_match_score(text1, text2)
-            final_sim = sim * (0.5 + 0.5 * kanji_score)
+            final_sim = 0.75 * sim + 0.25 * kanji_score
             final_sim = max(0.0, min(1.0, final_sim))
             self._semantic_cache[cache_key] = final_sim
             if len(self._semantic_cache) > 5000:
@@ -3691,50 +4752,67 @@ class TranslatorApp:
         # 有汉字缺失，需要embedding确认（可能是术语错误，如神殿→寺庙）
         return True, f"汉字缺失: {''.join(missing)}"
 
-    def _run_semantic_check(self, data):
-        """翻译完成后运行语义校验，检测术语错误条目。
-        所有条目都调用embedding计算相似度，相似度结合汉字匹配度打分。"""
-        if not self.enable_semantic_check.get():
-            return
+    def _scan_semantic_issues(self, data, src, tgt):
+        """翻译校准扫描核心：汉字预筛 + embedding打分，返回 (issues, checked, precheck_pass)。
+        仅检出中间值（0.4 ≤ sim < 阈值）；不弹窗，供精修前自动校准复用。
+        数据源用 self.translated（真实译文），不能用 data（其value在机翻后仍是原文）。"""
         threshold = self.semantic_threshold.get()
-        self._log(f"=== 翻译校准开始：embedding语义相似度 + 汉字匹配度打分，阈值 {threshold} ===")
         issues = []  # [(原文, 译文, 相似度)]
-        total = len(data)
+        items = self.translated if hasattr(self, 'translated') and self.translated else data
+        # 预筛掉不参与校准的条目：空值/译文=原文（跳过项、未翻译项）、垃圾（Unity输入轴/资源名等）
+        # 使进度分母只统计真实待校准译文，避免把跳过的原文项也算进 total
+        scan_items = {s: t for s, t in items.items()
+                      if s and s.strip() and t and t != s and not self._should_skip_translation(s)}
+        total = len(scan_items)
         checked = 0
-        for source, target in data.items():
+        precheck_pass = 0  # 汉字预筛选直接通过数
+        for source, target in scan_items.items():
             if self.should_stop:
                 break
-            if not source or not source.strip() or not target or target == source:
-                continue
-            # 跳过纯数字、URL、路径等不需要翻译的
-            if self._should_skip_translation(source):
-                continue
             checked += 1
-            # 所有条目都调用embedding（内部已结合汉字匹配度打分）
+            # 第一阶段：汉字预筛选（零成本）——原文汉字都出现在译文 → 翻译正常，直接通过
+            need_emb, reason = self._kanji_precheck(source, target)
+            if not need_emb:
+                precheck_pass += 1
+                continue
+            # 第二阶段：仅汉字缺失/无汉字的条目调用embedding（结合汉字匹配度打分）
             sim = self._semantic_similarity(source, target)
-            if sim < threshold:
+            # 只检出中间值：相似度特别低(<0.4)的条目大概率不是正常游戏文本（乱码/垃圾/完全无关），
+            # 精修也修不了，不放；0.4~阈值 之间的才是"翻得不准但能修"的真实文本
+            if 0.4 <= sim < threshold:
                 issues.append((source, target, sim))
             # 更新进度
             if checked % 50 == 0 or checked == total:
                 self.root.after(0, lambda c=checked, t=total, i=len(issues): self.status_label.config(
                     text=f"翻译校准进度: {c}/{t} | 已检出术语错误: {i} 条"))
+        return issues, checked, precheck_pass
+
+    def _run_semantic_check(self, data, src, tgt):
+        """翻译完成后运行语义校验，检测术语错误条目。
+        两阶段：①汉字预筛选（零成本，原文汉字都在译文 → 直接通过）
+               ②仅汉字缺失/无汉字的条目调用embedding（结合汉字匹配度打分）"""
+        if not self.enable_semantic_check.get():
+            return
+        threshold = self.semantic_threshold.get()
+        self._log(f"=== 翻译校准开始：汉字预筛选 + embedding语义相似度打分，阈值 {threshold} ===")
+        issues, checked, precheck_pass = self._scan_semantic_issues(data, src, tgt)
         if not issues:
-            self._log(f"翻译校准完成：扫描{checked}条，未发现术语错误")
+            self._log(f"翻译校准完成：扫描{checked}条（汉字预筛通过{precheck_pass}条），未发现术语错误")
             self.root.after(0, lambda: messagebox.showinfo("翻译校准完成",
-                f"共扫描 {checked} 条已翻译条目，未发现语义相似度低于 {threshold} 的术语错误。"))
+                f"共扫描 {checked} 条已翻译条目（汉字预筛放行 {precheck_pass} 条），未发现语义相似度低于 {threshold} 的术语错误。"))
             return
         # 显示检测结果
-        self._log(f"翻译校准完成：扫描{checked}条，检出{len(issues)}条可能术语错误")
-        self._show_semantic_issues_dialog(issues, data)
+        self._log(f"翻译校准完成：扫描{checked}条（汉字预筛通过{precheck_pass}条），检出{len(issues)}条可能术语错误")
+        self._show_semantic_issues_dialog(issues, data, src, tgt)
 
-    def _show_semantic_issues_dialog(self, issues, data):
-        """显示语义校验检出的术语错误条目对话框，支持勾选后清空译文重新翻译"""
+    def _show_semantic_issues_dialog(self, issues, data, src, tgt):
+        """显示语义校验检出的术语错误条目对话框，支持勾选后清空译文重新翻译 或 直接送LLM精修"""
         dlg = tk.Toplevel(self.root)
         dlg.title(f"翻译校准：检出 {len(issues)} 条可能术语错误")
         dlg.geometry("900x600")
         dlg.transient(self.root)
         dlg.grab_set()
-        ttk.Label(dlg, text=f"共检出 {len(issues)} 条语义相似度低于阈值的条目，可能是术语翻译错误（如神殿→寺庙）。勾选后可清空译文重新翻译。",
+        ttk.Label(dlg, text=f"共检出 {len(issues)} 条语义相似度低于阈值的条目，可能是术语翻译错误（如神殿→寺庙）。\n勾选后可「送LLM精修」直接修正，或「清空重翻」交给机翻重跑。",
                   font=("微软雅黑", 10), wraplength=850).pack(anchor=tk.W, padx=10, pady=(10, 5))
         # 列表区
         list_frame = ttk.Frame(dlg)
@@ -3786,6 +4864,9 @@ class TranslatorApp:
             if not messagebox.askyesno("确认", f"确定清空选中的 {len(selected)} 条译文？\n清空后点击「开始翻译」即可重新翻译这些条目。", parent=dlg):
                 return
             inf = self.input_file.get()
+            if not inf or not os.path.exists(inf):
+                messagebox.showerror("错误", "找不到输入文件", parent=dlg)
+                return
             for idx in selected:
                 source = issues_sorted[idx][0]
                 data[source] = source
@@ -3803,8 +4884,69 @@ class TranslatorApp:
                 dlg.destroy()
             except Exception as e:
                 messagebox.showerror("错误", f"保存失败：{e}", parent=dlg)
+        def _llm_refine_selected():
+            """把选中的校准检出条目直接送LLM精修（机翻→校准→LLM工作流）"""
+            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            if not selected:
+                messagebox.showinfo("提示", "请先勾选要精修的条目", parent=dlg)
+                return
+            if not messagebox.askyesno("确认", f"确定用LLM精修选中的 {len(selected)} 条？\n将使用API设置页的LLM逐条精修这些条目。", parent=dlg):
+                return
+            inf = self.input_file.get()
+            if not inf or not os.path.exists(inf):
+                messagebox.showerror("错误", "找不到输入文件", parent=dlg)
+                return
+            # 前置检查：API设置页需配置LLM才能精修
+            if not self.api_key.get().strip() or not self.base_url.get().strip() or not self.model.get().strip():
+                messagebox.showerror("错误",
+                    "API设置页未配置LLM（API Key / Base URL / 模型），无法精修。\n请先在「API设置」配置后再试。", parent=dlg)
+                return
+            # 构造 force_refine 列表（跳过质量筛选，直接精修校准检出的条目）
+            force_items = []
+            for idx in selected:
+                source, target, sim = issues_sorted[idx]
+                force_items.append((source, target, 0, True))
+            dlg.grab_release()
+            # 后台线程执行精修，完成后写回文件
+            def _worker():
+                try:
+                    self._run_refine_phase(data, src, tgt, force_refine=force_items)
+                    # 精修结果在 self.translated 中，写回文件
+                    updated = 0
+                    for source, _, _, _ in force_items:
+                        if source in self.translated and self.translated[source] != source:
+                            data[source] = self.translated[source]
+                            updated += 1
+                    with open(inf, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    pf = self.progress_file.get()
+                    if pf:
+                        with open(pf, 'w', encoding='utf-8') as f:
+                            json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                    self._log(f"翻译校准→LLM精修：{len(force_items)} 条已精修，成功更新 {updated} 条，已保存")
+                    # 在主线程收尾：弹窗可能已被用户关闭，需 winfo_exists 保护
+                    def _done():
+                        try:
+                            if dlg.winfo_exists():
+                                messagebox.showinfo("完成",
+                                    f"LLM精修完成：{len(force_items)} 条待精修，成功 {updated} 条。\n已写回文件。", parent=dlg)
+                                dlg.destroy()
+                        except Exception:
+                            pass
+                    self.root.after(0, _done)
+                except Exception as e:
+                    self._log(f"翻译校准→LLM精修失败: {e}")
+                    def _err():
+                        try:
+                            if dlg.winfo_exists():
+                                messagebox.showerror("错误", f"精修失败：{e}", parent=dlg)
+                        except Exception:
+                            pass
+                    self.root.after(0, _err)
+            threading.Thread(target=_worker, daemon=True).start()
         ttk.Button(btn_frame, text="全选", command=lambda: [v.set(True) for v in check_vars]).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="全不选", command=lambda: [v.set(False) for v in check_vars]).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="送LLM精修选中条目", command=_llm_refine_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="清空选中译文并重新翻译", command=_clear_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
 
@@ -4069,40 +5211,128 @@ class TranslatorApp:
             batches.append(current)
         return batches
 
-    def _run_refine_phase(self, data, src, tgt):
-        """第二阶段：评估质量并用LLM精修低分项（含重试/上下文/强制精修/语言名）"""
+    def _clean_refine_leak(self, text, key):
+        """清理LLM精修输出中残留的prompt格式（模型回显"原文：xxx"、"初译：xxx"、编号等），避免污染译文。
+        例：模型输出 "原文：時間がないから、急いでください。" → 剥离后得到实际译文。
+        若剥离后为空/只剩原文，返回空串，调用方据此拒绝采用。"""
+        if not text:
+            return text
+        t = text.strip()
+        # 剥离"原文：/初译：/精修后译文："等prompt标签前缀（模型回显输入）
+        m = re.match(r'^(?:原文|初译|原文文本|初译文|源文本|精修后译文|译文)[：:]\s*', t)
+        if m:
+            t = t[m.end():].strip()
+        # 剥离"编号：1." / "编号: 1" / "序号1、" 这类编号前缀（小模型批量输出常带）
+        m = re.match(r'^(?:编号|序号)[：:]\s*\d+\s*[\.、\)）]?\s*', t)
+        if m:
+            t = t[m.end():].strip()
+        # 剥离编号残留（如 "1. " / "1、" / "1)"）
+        m = re.match(r'^\d+\s*[\.、\)）]\s*', t)
+        if m:
+            t = t[m.end():].strip()
+        # 再剥离一次标签前缀（模型可能在编号后再输出"精修后译文："等）
+        m = re.match(r'^(?:原文|初译|原文文本|初译文|源文本|精修后译文|译文|翻译结果)[：:]\s*', t)
+        if m:
+            t = t[m.end():].strip()
+        # 剥离后若只等于原文（模型未翻译只回显），视为无效
+        if t == key or t == key.strip():
+            return ""
+        return t
+
+    def _run_calibrate_then_refine(self, data, src, tgt):
+        """机翻 → 翻译校准 → LLM精修 三阶段工作流（校准在前、精修在后）。
+        勾选「翻译校准」时：先自动扫描已翻译条目，用 embedding 打分检出问题条目，
+        再只把这些问题条目送 LLM 精修（不再由精修内部重复筛分）。
+        未勾校准：精修直接走纯规则打分筛选（不调 embedding，快）。"""
+        force = None
+        if self.enable_semantic_check.get():
+            self.root.after(0, lambda: self.status_label.config(text="进入第二阶段：翻译校准扫描问题条目..."))
+            self._log("=== 第二阶段：翻译校准 ===")
+            threshold = self.semantic_threshold.get()
+            issues, checked, precheck_pass = self._scan_semantic_issues(data, src, tgt)
+            self._log(f"翻译校准完成：扫描{checked}条（汉字预筛通过{precheck_pass}条），检出{len(issues)}条可能术语错误（阈值{threshold}）")
+            if issues:
+                force = [(s, t, 0, True) for s, t, _sim in issues]
+                self._log(f"校准检出 {len(issues)} 条问题条目 → 进入第三阶段送LLM精修")
+        self.root.after(0, lambda: self.status_label.config(text="进入第三阶段：LLM精修..."))
+        self._log("=== 第三阶段：LLM精修 ===")
+        self._run_refine_phase(data, src, tgt, force_refine=force)
+
+    def _run_refine_phase(self, data, src, tgt, force_refine=None):
+        """第二阶段：评估质量并用LLM精修低分项（含重试/上下文/强制精修/语言名）。
+        force_refine 传入时跳过质量筛选，直接精修指定条目列表（翻译校准联动）。"""
         src_name = LANG_NAMES.get(src, src)
         tgt_name = LANG_NAMES.get(tgt, tgt)
-        # 找出需要精修的条目（阈值筛选 + 极端长度比强制精修）
-        to_refine = []
-        threshold = self.refine_threshold.get()
-        for key in data:
-            translated = self.translated.get(key)
-            if translated and translated != key:
-                q = self._assess_quality(key, translated, src, tgt)
-                # 强制精修条件：极端长度比 + 低分且偏短
-                ratio = len(translated) / len(key) if len(key) > 0 else 0
-                forced = ratio < 0.15 or ratio > 8  # 极端长度比
-                if not forced and q < 70 and ratio < 0.2:
-                    forced = True  # 分数偏低且译文偏短，可能漏译
-                # 保底速通：非强制精修且质量>75分直接放行，谷歌/DeepL初译已足够，省LLM调用
-                if not forced and q > 75:
-                    continue
-                if q < threshold or forced:
-                    to_refine.append((key, translated, q, forced))
-        if not to_refine:
-            self._log("精修阶段：所有条目质量达标，无需精修")
-            return
-        forced_count = sum(1 for _, _, _, f in to_refine if f)
-        self._log(f"【精修模式·第二阶段】{len(to_refine)} 条待精修（阈值{threshold}分以下{len(to_refine)-forced_count}条 + 极端长度比强制{forced_count}条），LLM={self.model.get() or '未设置'}, 并发={self.refine_workers.get()}")
-        # 使用API设置页配置的OpenAI兼容LLM
-        try:
-            api_key = self.api_key.get()
-            base_url = self.base_url.get().rstrip('/')
-            model = self.model.get()
-            if not api_key or not base_url or not model:
-                self._log("精修阶段：API设置页未配置OpenAI兼容LLM（Key/BaseURL/模型），跳过精修。")
+        if force_refine is not None:
+            # 校准联动：直接精修校准检出的条目（已由汉字预筛+embedding筛选过）
+            to_refine = force_refine
+            if not to_refine:
                 return
+            forced_count = sum(1 for _, _, _, f in to_refine if f)
+            self._log(f"【精修模式·校准联动】{len(to_refine)} 条校准检出条目送LLM精修，LLM={self.model.get() or '未设置'}, 并发={self.refine_workers.get()}")
+        else:
+            # 找出需要精修的条目（纯规则 + embedding/汉字打分统一筛选，与翻译校准共用打分机制）
+            to_refine = []
+            threshold = self.refine_threshold.get()
+            sem_threshold = self.semantic_threshold.get()
+            # embedding打分可用性：只在勾选「翻译校准」时参与精修筛选；
+            # 不勾校准=要快，精修阶段就纯规则打分，不调本地embedding
+            sem_enabled = self.enable_semantic_check.get() and bool(
+                self.semantic_ollama_url.get().strip() and self.semantic_model.get().strip())
+            for key in data:
+                translated = self.translated.get(key)
+                if translated and translated != key:
+                    q = self._assess_quality(key, translated, src, tgt)
+                    # 强制精修条件：极端长度比 + 低分且偏短
+                    ratio = len(translated) / len(key) if len(key) > 0 else 0
+                    forced = ratio < 0.15 or ratio > 8  # 极端长度比
+                    if not forced and q < 70 and ratio < 0.2:
+                        forced = True  # 分数偏低且译文偏短，可能漏译
+                    # embedding+汉字打分（与校准共用）：汉字一致→不调embedding(视为高分)；汉字缺失→调embedding
+                    sim = 1.0
+                    if sem_enabled:
+                        need_emb, _reason = self._kanji_precheck(key, translated)
+                        if need_emb:
+                            sim = self._semantic_similarity(key, translated)
+                    # 保底速通：非强制精修且规则>75分且embedding分达标 → 放行（省LLM调用）
+                    if not forced and q > 75 and sim >= sem_threshold:
+                        continue
+                    if q < threshold or sim < sem_threshold or forced:
+                        to_refine.append((key, translated, q, forced))
+            if not to_refine:
+                self._log("精修阶段：所有条目质量达标，无需精修")
+                return
+            forced_count = sum(1 for _, _, _, f in to_refine if f)
+            self._log(f"【精修模式·第二阶段】{len(to_refine)} 条待精修（规则{threshold}分以下 + embedding{round(sem_threshold,2)}以下 + 极端长度比强制{forced_count}条），LLM={self.model.get() or '未设置'}, 并发={self.refine_workers.get()}")
+        # 精修LLM配置：优先使用精修独立配置（refine_llm_*，UI上可单独填），留空则回退上方API设置页主配置
+        try:
+            r_base = self.refine_llm_base_url.get().strip().rstrip('/')
+            r_model = self.refine_llm_model.get().strip()
+            r_key = self.refine_llm_api_key.get().strip()
+            r_local = 'localhost' in r_base.lower() or '127.0.0.1' in r_base
+            if r_base and r_model and (r_key or r_local):
+                api_key = r_key
+                base_url = r_base
+                model = r_model
+                is_local = r_local
+                self._log(f"【精修·LLM】使用精修独立配置: {model} @ {base_url}")
+            else:
+                api_key = self.api_key.get()
+                base_url = self.base_url.get().rstrip('/')
+                model = self.model.get()
+                is_local = 'localhost' in base_url.lower() or '127.0.0.1' in base_url
+                if r_base and r_model and not r_key and not r_local:
+                    self._log(f"【精修·LLM】精修独立配置({r_model}@{r_base})缺少API Key，回退使用API设置页主配置: {model} @ {base_url}")
+                else:
+                    self._log(f"【精修·LLM】使用API设置页主配置: {model} @ {base_url}")
+            if not base_url or not model:
+                self._log("精修阶段：未配置LLM（BaseURL/模型不完整），跳过精修。")
+                return
+            # 本地Ollama无需API Key；非本地（在线API）必须要有Key
+            if not api_key and not is_local:
+                self._log("精修阶段：非本地LLM缺少API Key，跳过精修。")
+                return
+            base_url = _norm_base(base_url)
             refine_url = base_url + "/v1/chat/completions" if not base_url.endswith("/v1") else base_url + "/chat/completions"
             prompt_template = self.refine_prompt.get()
             # 系统提示：动态插入语言名称
@@ -4135,8 +5365,8 @@ class TranslatorApp:
                         result = pool_request('POST', refine_url, body=payload, headers={
                             'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}',
                         }, timeout=120)
-                        refined = result['choices'][0]['message']['content'].strip()
-                        if refined and refined != initial_trans:
+                        refined = self._clean_refine_leak(result['choices'][0]['message']['content'].strip(), key)
+                        if refined and refined != initial_trans and refined != key:
                             phs = re.findall(r'\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>', key)
                             if all(ph in refined for ph in phs):
                                 # 致命错误检测：AI拒绝模式则不采用（不再比较总分，长度比变化是正常的）
@@ -4199,8 +5429,8 @@ class TranslatorApp:
                         # 逐条检查占位符 + AI拒绝模式检测，合格的采用
                         results = []
                         for i, (key, initial, q, forced) in enumerate(batch):
-                            refined = parsed[i]
-                            if refined and refined != initial:
+                            refined = self._clean_refine_leak(parsed[i], key)
+                            if refined and refined != initial and refined != key:
                                 phs = re.findall(r'\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>', key)
                                 if all(ph in refined for ph in phs):
                                     # 致命错误检测：AI拒绝模式则不采用（不再比较总分，长度比变化是正常的）
@@ -4234,10 +5464,14 @@ class TranslatorApp:
             # 分批（按字符数，每批不超过1500字）
             batches = self._batch_refine_items(to_refine, max_chars=1500)
             self._log(f"精修分批：{len(to_refine)} 条分为 {len(batches)} 批（按字符数≤1500/批）")
+            # 精修阶段进度条：重置范围为待精修条数，随批次推进
+            self.root.after(0, lambda: (self.progress_bar.__setitem__("maximum", max(1, len(to_refine))),
+                                        self.progress_bar.__setitem__("value", 0)))
 
             with ThreadPoolExecutor(max_workers=max(1, self.refine_workers.get())) as executor:
                 futures = {executor.submit(batch_refine_worker, batch): batch for batch in batches}
                 done_items = 0
+                last_reported = -1
                 for future in as_completed(futures):
                     if self.should_stop:
                         break
@@ -4248,22 +5482,28 @@ class TranslatorApp:
                             self.translated[key] = refined
                             refined_count += 1
                     done_items += batch_size
-                    if done_items % 10 == 0 or done_items >= len(to_refine):
+                    # 每完成一批就刷新精修进度（不再等满10条，待精修少时也能看到进度）
+                    if done_items != last_reported:
+                        last_reported = done_items
                         elapsed = time.time() - start_time
                         rate = done_items / elapsed if elapsed > 0 else 0
-                        self.root.after(0, lambda d=done_items, t=len(to_refine), r=rate: self.status_label.config(
-                            text=f"精修进度: {d}/{t} ({d*100//t if t else 0}%) | 速度: {r:.1f}条/秒 | 已精修: {refined_count}"))
+                        self.root.after(0, lambda d=done_items, t=len(to_refine), r=rate, rc=refined_count: (
+                            self.progress_bar.__setitem__("value", d),
+                            self.status_label.config(
+                                text=f"精修进度: {d}/{t} ({d*100//t if t else 0}%) | 速度: {r:.1f}条/秒 | 已精修: {rc}"))
+                        )
             self._log(f"精修阶段完成：共评估 {len(to_refine)} 条，成功精修 {refined_count} 条")
         except Exception as e:
             self._log(f"精修阶段出错: {e}")
 
     def _update_progress(self, done, total, rate, remain):
-        self.progress_bar["value"] = done
+        self.progress_bar["value"] = min(done, total)
         pause_str = " [已暂停]" if self.is_paused else ""
+        pending = max(0, total - done)
         self.status_label.config(
-            text=f"进度: {done}/{total} ({done*100//total if total else 0}%) | "
+            text=f"处理进度: {done}/{total} ({done*100//total if total else 0}%) | "
                  f"速度: {rate:.1f}条/秒 | 预计剩余: {remain/60:.1f}分钟 | "
-                 f"本轮已翻译: {self.count} | 失败: {self.errors}{pause_str}"
+                 f"成功: {self.count} | 待最终确认: {pending}{pause_str}"
         )
 
     def _toggle_pause(self):
@@ -4280,21 +5520,93 @@ class TranslatorApp:
     def _save_progress(self):
         pf = self.progress_file.get()
         if pf:
+            # 同样剔除垃圾条目，避免进度文件被乱码/资源名撑到数MB（垃圾不在翻译队列，无需进度记录）
+            slim = {k: v for k, v in self.translated.items() if not self._should_skip_translation(k)}
             with open(pf, 'w', encoding='utf-8') as f:
-                json.dump(self.translated, f, ensure_ascii=False)
+                json.dump(slim, f, ensure_ascii=False)
 
     def _save_output(self, data):
         outf = self.output_file.get()
         if outf:
-            final = {k: self.translated.get(k, k) for k in data}
+            final = {}
+            skipped = 0
+            for k in data:
+                # 剔除提取垃圾/乱码/资源名/路径/日汉同形等无需翻译的条目，避免输出文件被
+                # 37万条"译文==原文"的垃圾撑爆（96% 的 Unity 二进制乱码不该出现在输出里）
+                if self._should_skip_translation(k):
+                    skipped += 1
+                    continue
+                final[k] = self.translated.get(k, k)
+            # 写回 Unity 特征码（读取时已从 data 弹出，保存时还原，避免 meta 被当条目翻译）
+            if self._file_meta:
+                final['_mtool_meta'] = self._file_meta
             with open(outf, 'w', encoding='utf-8') as f:
                 json.dump(final, f, ensure_ascii=False, indent=2)
-            self._log(f"输出已保存: {outf}")
+            eff = len(final) - (1 if self._file_meta else 0)
+            self._log(f"输出已保存: {outf}（有效{eff}条，剔除垃圾{skipped}条）")
 
     def _stop_translate(self):
         self.should_stop = True
         self.is_paused = False
         self._log("正在停止...")
+
+    def _deepseek_cache_cost(self, stats, model_name=None):
+        """根据当前DeepSeek官方V4价格估算本轮真实API费用（人民币）。
+        未知模型不猜价格，只返回可显示的token统计。峰谷时间按北京时间判断。
+        """
+        if not stats:
+            return None
+        model = (model_name or self.model.get() or '').lower()
+        if 'deepseek-v4-flash' in model:
+            hit_peak, miss_peak, out_peak = 0.10, 3.00, 9.00
+        elif 'deepseek-v4-pro' in model:
+            hit_peak, miss_peak, out_peak = 0.30, 9.00, 27.00
+        else:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+            bj = datetime.datetime.now(ZoneInfo('Asia/Shanghai'))
+            is_peak = (9 <= bj.hour < 12) or (14 <= bj.hour < 18)
+        except Exception:
+            bj = datetime.datetime.now()
+            is_peak = (9 <= bj.hour < 12) or (14 <= bj.hour < 18)
+        factor = 1.0 if is_peak else 0.5
+        hit_rate = hit_peak * factor
+        miss_rate = miss_peak * factor
+        out_rate = out_peak * factor
+        hit = stats.get('hit', 0)
+        miss = stats.get('miss', 0)
+        completion = stats.get('completion', 0)
+        actual = (hit * hit_rate + miss * miss_rate + completion * out_rate) / 1_000_000
+        # 假设相同输入全部按miss计费，计算“缓存直接节省”部分；输出成本不计入节省。
+        saved = hit * (miss_rate - hit_rate) / 1_000_000
+        total_prompt = hit + miss
+        pct = hit * 100.0 / total_prompt if total_prompt else 0.0
+        return {
+            'model': model_name or self.model.get(),
+            'peak': is_peak,
+            'beijing_time': bj.strftime('%H:%M:%S'),
+            'hit_rate': pct,
+            'hit_tokens': hit,
+            'miss_tokens': miss,
+            'prompt_tokens': total_prompt,
+            'completion_tokens': completion,
+            'actual_cost': actual,
+            'saved_cost': max(0.0, saved),
+            'hit_rate_price': hit_rate,
+            'miss_rate_price': miss_rate,
+            'output_rate_price': out_rate,
+        }
+
+    def _format_cache_cost_report(self, report):
+        if not report:
+            return None
+        period = '高峰' if report['peak'] else '空闲'
+        return (
+            f"💰 Prompt缓存费用：约{report['actual_cost']:.4f}元 "
+            f"（缓存节省约{report['saved_cost']:.4f}元，{period}时段，北京时间{report['beijing_time']}）"
+            f"；输入{report['prompt_tokens']:,} tokens，输出{report['completion_tokens']:,} tokens"
+        )
 
     def _finish(self):
         self.is_running = False
@@ -4310,24 +5622,48 @@ class TranslatorApp:
             actual_failed = sum(1 for t in self.to_translate if t not in self.translated)
         else:
             actual_failed = self.errors
+        actual_success = max(0, (len(self.to_translate) if hasattr(self, 'to_translate') and self.to_translate else self.count) - actual_failed)
+        self.count = actual_success
         self.errors = actual_failed
-        self.status_label.config(text=f"完成！本轮翻译: {self.count} 条, 失败: {actual_failed} 条")
+        final_total = actual_success + actual_failed
+        self.progress_bar["maximum"] = max(1, final_total)
+        self.progress_bar["value"] = actual_success
+        self.status_label.config(text=f"完成！成功: {actual_success} 条, 最终失败: {actual_failed} 条（总计 {final_total} 条）")
+        # embedding 智能免翻全程总结：让用户明确看到"翻译前扫描+跳过"做了什么
+        if self.embed_skip_enable.get() and hasattr(self, '_embed_skip_map') and self._embed_skip_map:
+            skip_total = sum(1 for v in self._embed_skip_map.values() if v)
+            self._log(f"✅ 本轮 embedding 智能免翻: 共扫描 {len(self._embed_skip_map)} 条去重文本, 跳过 {skip_total} 条（资源名/代码/内部名, 不送翻译）")
         self._log(f"翻译完成！本轮: {self.count} 条, 失败: {actual_failed} 条, 耗时: {self.total_elapsed:.1f}秒")
         finish_msg = f"翻译完成！\n本轮: {self.count} 条\n失败: {actual_failed} 条\n耗时: {self.total_elapsed:.1f}秒\n输出: {self.output_file.get()}"
+        cache_stats = getattr(self, 'last_cache_stats', None)
+        if cache_stats and (cache_stats.get('hit') or cache_stats.get('miss')):
+            total_cache = cache_stats.get('hit', 0) + cache_stats.get('miss', 0)
+            cache_pct = cache_stats.get('hit', 0) * 100.0 / total_cache if total_cache else 0.0
+            self._log(f"💾 Prompt缓存：命中 {cache_stats.get('hit',0):,} / 未命中 {cache_stats.get('miss',0):,} tokens，命中率 {cache_pct:.1f}%")
+            cache_report = self._deepseek_cache_cost(cache_stats)
+            cost_line = self._format_cache_cost_report(cache_report)
+            if cost_line:
+                self._log(cost_line)
+                finish_msg += f"\n\nPrompt缓存命中率：{cache_pct:.1f}%\n缓存节省：约{cache_report['saved_cost']:.4f}元\n本轮API费用：约{cache_report['actual_cost']:.4f}元"
         if actual_failed > 0:
             finish_msg += f"\n\n{actual_failed} 条失败条目未写入进度，重新选择同一文件并点击「开始翻译」即可自动重试。"
         messagebox.showinfo("完成", finish_msg)
         # 发送WebHook通知
         if self.webhook_url.get().strip():
             threading.Thread(target=self._send_webhook, daemon=True).start()
-        # 翻译校准：翻译完成后自动运行语义校验（检测术语错误）
-        if self.enable_semantic_check.get() and hasattr(self, 'to_translate') and self.to_translate:
+        # 翻译校准：翻译完成后自动运行语义校验（检测术语错误）。
+        # 精修模式下校准已在精修前自动跑过（机翻→校准→精修），这里不重复
+        if self.enable_semantic_check.get() and not self.refine_mode.get() and hasattr(self, 'to_translate') and self.to_translate:
             try:
                 inf = self.input_file.get()
                 if inf and os.path.exists(inf):
                     with open(inf, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                    threading.Thread(target=self._run_semantic_check, args=(data,), daemon=True).start()
+                    src_c = self._get_lang_code(self.source_lang.get())
+                    tgt_c = self._get_lang_code(self.target_lang.get())
+                    if tgt_c == "auto":
+                        tgt_c = "zh-CN"
+                    threading.Thread(target=self._run_semantic_check, args=(data, src_c, tgt_c), daemon=True).start()
             except Exception as e:
                 self._log(f"翻译校准启动失败: {e}")
 
@@ -4358,6 +5694,9 @@ class TranslatorApp:
             "semantic_ollama_url": self.semantic_ollama_url.get(),
             "semantic_model": self.semantic_model.get(),
             "semantic_threshold": self.semantic_threshold.get(),
+            # embedding 智能识别免翻内容
+            "embed_skip_enable": self.embed_skip_enable.get(),
+            "embed_skip_threshold": self.embed_skip_threshold.get(),
         }
         try:
             with open(f, 'w', encoding='utf-8') as fh:
@@ -4392,8 +5731,11 @@ class TranslatorApp:
             # 翻译校准（语义校验）
             self.enable_semantic_check.set(config.get("enable_semantic_check", False))
             self.semantic_ollama_url.set(config.get("semantic_ollama_url", "http://localhost:11434"))
-            self.semantic_model.set(config.get("semantic_model", "nomic-embed-text"))
+            self.semantic_model.set(config.get("semantic_model", "yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0"))
             self.semantic_threshold.set(config.get("semantic_threshold", 0.75))
+            # embedding 智能识别免翻内容
+            self.embed_skip_enable.set(config.get("embed_skip_enable", False))
+            self.embed_skip_threshold.set(config.get("embed_skip_threshold", 0.30))
             self._on_api_change()
             self._log(f"配置已加载: {f}")
             messagebox.showinfo("成功", f"配置已加载:\n{f}")
@@ -4511,6 +5853,26 @@ class TranslatorApp:
                 f"重试次数: {self.max_retry.get()}\n"
                 f"分段大小: {self.chunk_size.get()}"
             )
+            cache_stats = getattr(self, 'last_cache_stats', None)
+            if cache_stats and (cache_stats.get('hit') or cache_stats.get('miss')):
+                total_cache = cache_stats.get('hit', 0) + cache_stats.get('miss', 0)
+                cache_pct = cache_stats.get('hit', 0) * 100.0 / total_cache if total_cache else 0.0
+                report += (
+                    f"\n【Prompt Cache】\n"
+                    f"命中Token: {cache_stats.get('hit',0):,}\n"
+                    f"未命中Token: {cache_stats.get('miss',0):,}\n"
+                    f"命中率: {cache_pct:.1f}%\n"
+                    f"输入Token: {cache_stats.get('prompt', total_cache):,}\n"
+                    f"输出Token: {cache_stats.get('completion',0):,}\n"
+                )
+                cache_report = self._deepseek_cache_cost(cache_stats)
+                if cache_report:
+                    report += (
+                        f"API费用估算: {cache_report['actual_cost']:.4f}元\n"
+                        f"缓存节省: {cache_report['saved_cost']:.4f}元\n"
+                        f"时段: {'高峰' if cache_report['peak'] else '空闲'}（北京时间{cache_report['beijing_time']}）\n"
+                    )
+
             # 显示在新窗口
             win = tk.Toplevel(self.root)
             win.title("翻译统计报告")
@@ -4551,7 +5913,13 @@ class TranslatorApp:
             _safe(self.chunk_size, cfg.get("chunk_size", 1500))
             _safe(self.batch_size, cfg.get("batch_size", 5))
             _safe(self.protect_placeholders, cfg.get("protect_placeholders", True))
-            _safe(self.protect_patterns, cfg.get("protect_patterns", r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>"))
+            # 占位符保护规则：旧默认值自动升级为新版（增加 [name] / \V[n] / %name% 等游戏引擎变量）
+            _OLD_PROTECT = r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>"
+            _NEW_PROTECT = r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>|\[[a-zA-Z_][a-zA-Z0-9_]*\]|\\[VvNnIiCc]\s*\[\d+\]|%[a-zA-Z_][a-zA-Z0-9_]*%|\[\[[^\]]+\]\]"
+            _cfg_pattern = cfg.get("protect_patterns", _NEW_PROTECT)
+            if _cfg_pattern == _OLD_PROTECT:
+                _cfg_pattern = _NEW_PROTECT
+            _safe(self.protect_patterns, _cfg_pattern)
             _safe(self.dark_mode, cfg.get("dark_mode", False))
             _safe(self.webhook_url, cfg.get("webhook_url", ""))
             _safe(self.webhook_type, cfg.get("webhook_type", "generic"))
@@ -4580,8 +5948,11 @@ class TranslatorApp:
             # 翻译校准（语义校验）
             _safe(self.enable_semantic_check, cfg.get("enable_semantic_check", False))
             _safe(self.semantic_ollama_url, cfg.get("semantic_ollama_url", "http://localhost:11434"))
-            _safe(self.semantic_model, cfg.get("semantic_model", "nomic-embed-text"))
+            _safe(self.semantic_model, cfg.get("semantic_model", "yxchia/paraphrase-multilingual-minilm-l12-v2:Q8_0"))
             _safe(self.semantic_threshold, cfg.get("semantic_threshold", 0.75))
+            # embedding 智能识别免翻内容
+            _safe(self.embed_skip_enable, cfg.get("embed_skip_enable", False))
+            _safe(self.embed_skip_threshold, cfg.get("embed_skip_threshold", 0.30))
             try:
                 self._on_api_change()
             except Exception:
@@ -4616,7 +5987,9 @@ class TranslatorApp:
                     self.engine_b_batch_size,
                     # 翻译校准（语义校验）
                     self.enable_semantic_check, self.semantic_ollama_url,
-                    self.semantic_model, self.semantic_threshold]:
+                    self.semantic_model, self.semantic_threshold,
+                    # embedding 智能识别免翻内容
+                    self.embed_skip_enable, self.embed_skip_threshold]:
             var.trace_add("write", self._auto_save_config)
 
     def _auto_save_config(self, *args):
@@ -4671,6 +6044,9 @@ class TranslatorApp:
                 "semantic_ollama_url": self.semantic_ollama_url.get(),
                 "semantic_model": self.semantic_model.get(),
                 "semantic_threshold": self.semantic_threshold.get(),
+                # embedding 智能识别免翻内容
+                "embed_skip_enable": self.embed_skip_enable.get(),
+                "embed_skip_threshold": self.embed_skip_threshold.get(),
             }
             with open(self._config_file, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -4740,17 +6116,17 @@ class TranslatorApp:
             pass
 
     # ==================== 插件系统 ====================
+
     def _load_plugins(self):
-        """扫描plugins目录，动态加载自定义翻译引擎"""
+        """扫描 plugins 目录，支持根目录插件和“一目录一插件”的插件包。"""
         plugin_dir = self._plugin_dir
         if not os.path.exists(plugin_dir):
             try:
                 os.makedirs(plugin_dir)
-                # 创建示例插件
                 sample = os.path.join(plugin_dir, "example_plugin.py")
                 if not os.path.exists(sample):
                     with open(sample, 'w', encoding='utf-8') as f:
-                        f.write('''# 自定义翻译引擎插件示例
+                        f.write("""# 自定义翻译引擎插件示例
 # 复制此文件，修改类名和translate方法即可添加自定义引擎
 # 插件会自动出现在引擎下拉列表中
 
@@ -4767,9 +6143,8 @@ class ExampleTranslator:
         self.timeout = timeout
 
     def translate(self, text, source_lang, target_lang):
-        # 在这里实现你的翻译逻辑
         return text
-''')
+""")
             except Exception:
                 pass
             return
@@ -4777,32 +6152,105 @@ class ExampleTranslator:
         import sys
         import importlib.util
         count = 0
-        for filename in os.listdir(plugin_dir):
-            if filename.endswith(".py") and not filename.startswith("_"):
-                module_name = filename[:-3]
-                try:
-                    if module_name in sys.modules:
-                        importlib.reload(sys.modules[module_name])
-                        module = sys.modules[module_name]
-                    else:
-                        spec = importlib.util.spec_from_file_location(module_name, os.path.join(plugin_dir, filename))
-                        module = importlib.util.module_from_spec(spec)
-                        sys.modules[module_name] = module
-                        spec.loader.exec_module(module)
-                    # 查找插件中的翻译引擎类
-                    for attr_name in dir(module):
+        func_count = 0
+        loaded_paths = set()
+
+        def _read_source(path):
+            try:
+                with open(path, 'r', encoding='utf-8-sig') as f:
+                    return f.read()
+            except Exception:
+                return ''
+
+        def _is_plugin_entry(path):
+            text = _read_source(path)
+            return ('def init_plugin' in text or 'plugin_is_engine' in text or
+                    ('class ' in text and 'name =' in text and 'translate' in text))
+
+        def _load_one(path, display_name):
+            nonlocal count, func_count
+            path = os.path.abspath(path)
+            if path in loaded_paths:
+                return
+            loaded_paths.add(path)
+            plugin_parent = os.path.dirname(path)
+            base = os.path.splitext(os.path.basename(path))[0]
+            parent = os.path.basename(plugin_parent)
+            module_name = 'mtool_plugin_' + re.sub(r'[^0-9A-Za-z_]', '_', parent + '_' + base)
+            old_sys_path = list(sys.path)
+            try:
+                if plugin_parent not in sys.path:
+                    sys.path.insert(0, plugin_parent)
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError('无法创建插件加载器')
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                module_has_init = hasattr(module, 'init_plugin') and callable(getattr(module, 'init_plugin'))
+                for attr_name in dir(module):
+                    try:
                         attr = getattr(module, attr_name)
-                        if isinstance(attr, type) and hasattr(attr, 'name') and hasattr(attr, 'translate') and attr_name != "TranslatorBase":
-                            if attr not in TRANSLATORS and attr.name not in [t.name for t in TRANSLATORS]:
-                                TRANSLATORS.append(attr)
-                                count += 1
-                except Exception as e:
-                    self._log(f"加载插件 {filename} 失败: {e}")
+                    except Exception:
+                        continue
+                    if isinstance(attr, type) and hasattr(attr, 'name') and hasattr(attr, 'translate') and attr_name != 'TranslatorBase':
+                        if module_has_init and not getattr(attr, 'plugin_is_engine', False):
+                            continue
+                        if attr not in TRANSLATORS and attr.name not in [t.name for t in TRANSLATORS]:
+                            TRANSLATORS.append(attr)
+                            count += 1
+
+                if module_has_init:
+                    module.init_plugin(self)
+                    func_count += 1
+                    self._log(f'已加载功能插件：{display_name}')
+            except Exception as e:
+                self._log(f'加载插件 {display_name} 失败: {e}')
+            finally:
+                sys.path[:] = old_sys_path
+
+        # 根目录插件：保持旧行为
+        for filename in sorted(os.listdir(plugin_dir)):
+            full = os.path.join(plugin_dir, filename)
+            if os.path.isfile(full) and filename.endswith('.py') and not filename.startswith('_'):
+                _load_one(full, filename)
+
+        # 子目录插件包：只加载显式入口，避免 xp3_adapter.py 等依赖被误注册
+        try:
+            subdirs = sorted(
+                d for d in os.listdir(plugin_dir)
+                if not d.startswith('.') and os.path.isdir(os.path.join(plugin_dir, d))
+            )
+        except Exception:
+            subdirs = []
+
+        for dirname in subdirs:
+            pkg_dir = os.path.join(plugin_dir, dirname)
+            entries = []
+            try:
+                for filename in sorted(os.listdir(pkg_dir)):
+                    if not filename.endswith('.py') or filename.startswith('_'):
+                        continue
+                    full = os.path.join(pkg_dir, filename)
+                    if os.path.isfile(full) and _is_plugin_entry(full):
+                        entries.append(full)
+            except Exception as e:
+                self._log(f'扫描插件包 {dirname} 失败: {e}')
+                continue
+
+            if not entries:
+                continue
+            # 优先真正的 init_plugin 入口；同一包默认只加载一个入口文件
+            preferred = next((x for x in entries if 'def init_plugin' in _read_source(x)), entries[0])
+            _load_one(preferred, f'{dirname}/{os.path.basename(preferred)}')
+
         if count > 0:
-            self._log(f"已加载 {count} 个自定义翻译引擎插件")
-            # 刷新引擎下拉框
+            self._log(f'已加载 {count} 个自定义翻译引擎插件')
             if hasattr(self, 'api_combo'):
                 self.api_combo['values'] = [t.name for t in TRANSLATORS]
+        if func_count > 0:
+            self._log(f'已加载 {func_count} 个功能扩展插件（已注册到工具菜单）')
 
     def _plugin_manager(self):
         """插件管理器窗口：查看已加载插件、插件文件列表"""
@@ -5208,9 +6656,55 @@ def main():
         return
     if dnd_available:
         app._setup_dnd()
+    # Tk回调异常记录：pythonw下没有控制台，回调里报错会被静默吞掉，
+    # 全部写进 ui_callback_errors.txt 便于排查"翻译完成后没反应"这类问题
+    def _report_callback_exception(exc_type, exc_value, exc_tb):
+        try:
+            import traceback
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_callback_errors.txt"),
+                      "a", encoding="utf-8") as f:
+                f.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} UI回调异常 ====\n")
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        except Exception:
+            pass
+    root.report_callback_exception = _report_callback_exception
+    # UI卡死黑匣子：主线程>15秒无心跳时，把所有线程的调用栈写进 ui_freeze_log.txt，
+    # 方便定位"翻译完成后窗口未响应"这类问题的确切卡点
+    _install_freeze_watchdog(root)
     # 后台检查更新（不阻塞启动）
     threading.Thread(target=check_for_updates, args=(root,), daemon=True).start()
     root.mainloop()
+
+
+def _install_freeze_watchdog(root):
+    try:
+        import faulthandler
+    except Exception:
+        return
+    last_beat = [time.time()]
+
+    def _beat():
+        last_beat[0] = time.time()
+        try:
+            root.after(2000, _beat)
+        except Exception:
+            pass
+
+    def _watch():
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_freeze_log.txt")
+        while True:
+            time.sleep(5)
+            if time.time() - last_beat[0] > 15:
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n==== UI主线程疑似卡死 {time.strftime('%Y-%m-%d %H:%M:%S')}，当前各线程调用栈 ====\n")
+                        faulthandler.dump_traceback(file=f)
+                except Exception:
+                    pass
+                last_beat[0] = time.time()  # 避免每5秒重复写
+
+    root.after(2000, _beat)
+    threading.Thread(target=_watch, daemon=True).start()
 
 
 if __name__ == '__main__':
