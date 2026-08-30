@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# 本地配置与缓存（含 API Key，切勿提交）
+auto_config.json
+*.cfg
+translation_cache.json
+term_glossary.txt
+
+# 运行日志
+ui_callback_errors.txt
+
+# 本地测试目录
+_ttg_test/
+
+# 进度文件
+trans_progress.json
+*.progress
