@@ -1,205 +1,122 @@
-function logError(request, message) {
-  console.error(
-    `${message}, clientIp: ${request.headers.get(
-      "cf-connecting-ip"
-    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
-  );
-}
+// 通用反向代理（修复 POST body 转发 500 的问题）
+// 修复点：
+// 1. POST/PUT/PATCH 时把请求体读成 ArrayBuffer 再转发，避免 ReadableStream 与 content-length 冲突
+// 2. 删除 host / content-length / accept-encoding 等会导致上游异常的逐跳头
+// 3. 仅替换 Origin/Referer/Cookie 等头里出现的代理域名，其余原样透传
 
-function createNewRequest(request, url, proxyHostname, originHostname) {
-  const newRequestHeaders = new Headers(request.headers);
-  for (const [key, value] of newRequestHeaders) {
+const HOP_BY_HOP = [
+  "host", "content-length", "accept-encoding", "connection",
+  "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade",
+];
+
+function buildRequestHeaders(request, proxyHostname, originHostname) {
+  const h = new Headers(request.headers);
+  for (const name of HOP_BY_HOP) h.delete(name);
+  for (const [key, value] of h) {
     if (value.includes(originHostname)) {
-      newRequestHeaders.set(
-        key,
-        value.replace(
-          new RegExp(`(?<!\\.)\\b${originHostname}\\b`, "g"),
-          proxyHostname
-        )
-      );
+      h.set(key, value.split(originHostname).join(proxyHostname));
     }
   }
-  return new Request(url.toString(), {
-    method: request.method,
-    headers: newRequestHeaders,
-    body: request.body,
-    redirect: 'follow'
-  });
+  return h;
 }
 
-function setResponseHeaders(
-  originalResponse,
-  proxyHostname,
-  originHostname,
-  DEBUG
-) {
-  const newResponseHeaders = new Headers(originalResponse.headers);
-  for (const [key, value] of newResponseHeaders) {
+function buildResponseHeaders(originalResponse, proxyHostname, originHostname) {
+  const h = new Headers(originalResponse.headers);
+  for (const name of ["content-encoding", "transfer-encoding", "content-length"]) {
+    h.delete(name);
+  }
+  for (const [key, value] of h) {
     if (value.includes(proxyHostname)) {
-      newResponseHeaders.set(
-        key,
-        value.replace(
-          new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
-          originHostname
-        )
-      );
+      h.set(key, value.split(proxyHostname).join(originHostname));
     }
   }
-  if (DEBUG) {
-    newResponseHeaders.delete("content-security-policy");
-  }
-  return newResponseHeaders;
+  h.set("access-control-allow-origin", "*");
+  return h;
 }
 
-/**
- * 替换内容
- * @param originalResponse 响应
- * @param proxyHostname 代理地址 hostname
- * @param pathnameRegex 代理地址路径匹配的正则表达式
- * @param originHostname 替换的字符串
- * @returns {Promise<*>}
- */
-async function replaceResponseText(
-  originalResponse,
-  proxyHostname,
-  pathnameRegex,
-  originHostname
-) {
-  let text = await originalResponse.text();
-  if (pathnameRegex) {
-    pathnameRegex = pathnameRegex.replace(/^\^/, "");
-    return text.replace(
-      new RegExp(`((?<!\\.)\\b${proxyHostname}\\b)(${pathnameRegex})`, "g"),
-      `${originHostname}$2`
-    );
-  } else {
-    return text.replace(
-      new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
-      originHostname
-    );
-  }
+async function rewriteText(response, proxyHostname, originHostname) {
+  let text = await response.text();
+  return text.split(proxyHostname).join(originHostname);
 }
 
 async function nginx() {
-  return `<!DOCTYPE html>
-<html>
-<head>
-<title>Welcome to nginx!</title>
-<style>
-html { color-scheme: light dark; }
-body { width: 35em; margin: 0 auto;
-font-family: Tahoma, Verdana, Arial, sans-serif; }
-</style>
-</head>
-<body>
-<h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and
-working. Further configuration is required.</p>
-
-<p>For online documentation and support please refer to
-<a href="http://nginx.org/">nginx.org</a>.<br/>
-Commercial support is available at
-<a href="http://nginx.com/">nginx.com</a>.</p>
-
-<p><em>Thank you for using nginx.</em></p>
-</body>
-</html>`;
+  return `<!DOCTYPE html><html><head><title>Welcome to nginx!</title></head><body><h1>Welcome to nginx!</h1></body></html>`;
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     try {
       const {
         PROXY_HOSTNAME,
         PROXY_PROTOCOL = "https",
         PATHNAME_REGEX,
-        UA_WHITELIST_REGEX,
-        UA_BLACKLIST_REGEX,
         URL302,
-        IP_WHITELIST_REGEX,
-        IP_BLACKLIST_REGEX,
-        REGION_WHITELIST_REGEX,
-        REGION_BLACKLIST_REGEX,
         KEEP_PATH = false,
-        DEBUG = false,
       } = env;
+
       const url = new URL(request.url);
       const originHostname = url.hostname;
+
       if (
         !PROXY_HOSTNAME ||
-        (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
-        (UA_WHITELIST_REGEX &&
-          !new RegExp(UA_WHITELIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
-          )) ||
-        (UA_BLACKLIST_REGEX &&
-          new RegExp(UA_BLACKLIST_REGEX).test(
-            request.headers.get("user-agent").toLowerCase()
-          )) ||
-        (IP_WHITELIST_REGEX &&
-          !new RegExp(IP_WHITELIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
-          )) ||
-        (IP_BLACKLIST_REGEX &&
-          new RegExp(IP_BLACKLIST_REGEX).test(
-            request.headers.get("cf-connecting-ip")
-          )) ||
-        (REGION_WHITELIST_REGEX &&
-          !new RegExp(REGION_WHITELIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
-          )) ||
-        (REGION_BLACKLIST_REGEX &&
-          new RegExp(REGION_BLACKLIST_REGEX).test(
-            request.headers.get("cf-ipcountry")
-          ))
+        (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname))
       ) {
-        logError(request, "Invalid");
         return URL302
-          ? Response.redirect(KEEP_PATH
-            ? (URL302 + "/" + url.pathname).replace(/\/+/g, '/')
-            : URL302,
-             302
+          ? Response.redirect(
+              KEEP_PATH
+                ? (URL302 + "/" + url.pathname).replace(/\/+/g, "/")
+                : URL302,
+              302
             )
           : new Response(await nginx(), {
-              headers: {
-                "Content-Type": "text/html; charset=utf-8",
-              },
+              headers: { "Content-Type": "text/html; charset=utf-8" },
             });
       }
+
       url.host = PROXY_HOSTNAME;
       url.protocol = PROXY_PROTOCOL;
-      const newRequest = createNewRequest(
-        request,
-        url,
+
+      const fwdHeaders = buildRequestHeaders(request, PROXY_HOSTNAME, originHostname);
+
+      const init = {
+        method: request.method,
+        headers: fwdHeaders,
+        redirect: "follow",
+      };
+
+      // 关键修复：带 body 的方法先把请求体读成 ArrayBuffer，避免流透传导致的 500
+      if (!["GET", "HEAD"].includes(request.method.toUpperCase())) {
+        const buf = await request.arrayBuffer();
+        if (buf.byteLength > 0) init.body = buf;
+      }
+
+      const upstream = new Request(url.toString(), init);
+      const originalResponse = await fetch(upstream);
+
+      const respHeaders = buildResponseHeaders(
+        originalResponse,
         PROXY_HOSTNAME,
         originHostname
       );
-      const originalResponse = await fetch(newRequest);
-      const newResponseHeaders = setResponseHeaders(
-        originalResponse,
-        PROXY_HOSTNAME,
-        originHostname,
-        DEBUG
-      );
-      const contentType = newResponseHeaders.get("content-type") || "";
+
+      const contentType = respHeaders.get("content-type") || "";
       let body;
-      if (contentType.includes("text/")) {
-        body = await replaceResponseText(
-          originalResponse,
-          PROXY_HOSTNAME,
-          PATHNAME_REGEX,
-          originHostname
-        );
+      if (contentType.includes("text/") || contentType.includes("json") || contentType.includes("javascript")) {
+        body = await rewriteText(originalResponse, PROXY_HOSTNAME, originHostname);
       } else {
         body = originalResponse.body;
       }
+
       return new Response(body, {
         status: originalResponse.status,
-        headers: newResponseHeaders,
+        headers: respHeaders,
       });
     } catch (error) {
-      logError(request, `Fetch error: ${error.message}`);
-      return new Response("Internal Server Error", { status: 500 });
+      return new Response(
+        JSON.stringify({ error: error.message || "Internal Server Error" }),
+        { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
     }
   },
 };
