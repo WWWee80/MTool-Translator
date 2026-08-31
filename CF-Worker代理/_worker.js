@@ -1,4 +1,25 @@
-// 通用反向代理（修复 POST body 转发 500 的问题）
+/*
+ * 通用 Cloudflare Worker 反向代理（用于必应翻译等场景）
+ * ---------------------------------------------------------------------------
+ * 本文件是 jonssonyan/cf-workers-proxy 的衍生作品（Modified Version）：
+ *   原始项目 : https://github.com/jonssonyan/cf-workers-proxy
+ *   原始作者 : jonssonyan
+ *   开源协议 : GNU General Public License v3.0 (GPL-3.0)
+ *   协议全文 : 见同目录 licenses/GPL-3.0.txt
+ *
+ * 相对上游的修改内容（2026-08，by WWWee80 / MTool-Translator）：
+ *   1. 修复 POST/PUT/PATCH 请求体透传导致的 HTTP 500：
+ *      改为先 await request.arrayBuffer() 读取后再转发，避免 ReadableStream
+ *      与 content-length 冲突；
+ *   2. 转发前删除 host / content-length / accept-encoding 等逐跳(hop-by-hop)头；
+ *   3. 精简未使用的 UA/IP/Region 黑白名单等可选逻辑，响应统一补 CORS 头；
+ *   4. 错误响应改为 JSON，便于上层定位。
+ *
+ * 按 GPL-3.0 要求：本衍生文件同样以 GPL-3.0 开源，保留原作者版权声明；
+ * 分发时须同时提供源码。本程序不提供任何担保（NO WARRANTY）。
+ * ---------------------------------------------------------------------------
+ */
+
 // 修复点：
 // 1. POST/PUT/PATCH 时把请求体读成 ArrayBuffer 再转发，避免 ReadableStream 与 content-length 冲突
 // 2. 删除 host / content-length / accept-encoding 等会导致上游异常的逐跳头

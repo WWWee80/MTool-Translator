@@ -1,10 +1,36 @@
-// MTool 谷歌翻译代理（带 tk 签名 + 会话Cookie 反爬增强版）
-// 思路参考 UniClawAI/google_translate：
-// 1) 先访问 translate 主页拿会话 Cookie 并全局缓存
-// 2) 对每条文本用 TKK 计算 tk 签名
-// 3) 带 Cookie + tk + 浏览器头请求，显著降低被判定为机器人(429)的概率
-// 4) 对 MTool 保持 /translate_a/single 原始数组返回格式，上层无感知
-// 5) 仍保留多 TLD 端点轮换兜底
+/*
+ * MTool 谷歌翻译 Cloudflare Worker 代理（tk 签名 + 会话 Cookie 抗限流版）
+ * ---------------------------------------------------------------------------
+ * 版权与开源致谢（Third-Party Notices）：
+ *
+ * 1. Google Translate 的 tk(TKK) 签名算法是社区广泛流传的公开通用算法。
+ *    本文件中的 calcTk/rl 为该算法的独立 JavaScript 实现，编写时参考了：
+ *      - Stichoza/google-translate-php  https://github.com/Stichoza/google-translate-php
+ *        Copyright (c) 2013 Levan Velijanashvili，MIT License
+ *        （MIT 协议全文见同目录 licenses/MIT-Stichoza.txt）
+ *      - 以及 googletrans / gtts 等多个等价开源实现中的同一公开算法。
+ *
+ * 2. “先访问翻译主页获取会话 Cookie + 携带 tk + 会话复用”的抗限流工程思路，
+ *    参考致谢 UniClawAI/google_translate
+ *      https://github.com/UniClawAI/google_translate
+ *    （注：该仓库未附带 LICENSE 文件，此处仅为思路/方法层面的致谢，未逐字复制其代码；
+ *      方法与思路本身不受著作权保护。）
+ *
+ * 3. 多国家 TLD 端点随机轮换为社区通用做法。
+ *
+ * 除上述标注的 MIT 许可部分外，本文件的 Worker 编排、Cookie 边缘缓存、
+ * 端点轮换与整轮重试逻辑均由 WWWee80 / MTool-Translator 编写。
+ *
+ * 本程序不提供任何担保（AS IS, NO WARRANTY）。谷歌翻译非官方接口随时可能调整，
+ * 详见同目录《谷歌翻译代理部署说明.md》。
+ * ---------------------------------------------------------------------------
+ * 工作流程：
+ * 1) 首次访问 translate 主页拿会话 Cookie 并在边缘节点缓存
+ * 2) 对每条文本用 TKK 计算 tk 签名
+ * 3) 带 Cookie + tk + 浏览器头请求，降低被判定为机器人(429)的概率
+ * 4) 对 MTool 保持 /translate_a/single 原始数组返回格式，上层无感知
+ * 5) 多 TLD 端点随机轮换，第一轮全失败则刷新 Cookie 整轮重试一次
+ */
 
 const TKK = [406604, 1836941114];
 
@@ -23,7 +49,7 @@ const ENDPOINTS = [
   "translate.google.com.au",
 ];
 
-// ---------- tk 签名算法（Google Translate 经典 TKK 算法的 JS 实现） ----------
+// ---------- tk 签名算法：Google Translate 公开 TKK 算法的独立 JS 实现（见文件头致谢，MIT） ----------
 function rl(a, b) {
   for (let c = 0; c < b.length - 2; c += 3) {
     let d = b[c + 2];

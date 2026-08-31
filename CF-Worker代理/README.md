@@ -4,13 +4,15 @@
 
 ## 文件说明
 
-| 文件 | 用途 |
+| 文件 / 目录 | 用途 |
 |------|------|
 | `谷歌翻译代理部署说明.md` | 谷歌翻译 Worker 代理详细部署教程 |
 | `必应翻译代理部署说明.md` | 必应翻译 Worker 代理详细部署教程 |
 | `cf-worker-google-proxy.js` | 谷歌翻译专用代理代码（**tk 签名 + 会话 Cookie 抗限流版**） |
-| `_worker.js` | 通用反向代理代码（必应翻译用，已修复 POST 转发，改自 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy)） |
+| `_worker.js` | 通用反向代理代码（必应翻译用，衍生自 cf-workers-proxy，**GPL-3.0**） |
 | `wrangler.toml` | Wrangler CLI 配置（可选，命令行部署用，必应上游已设为 cn.bing.com） |
+| `THIRD_PARTY_NOTICES.md` | **第三方开源声明、来源与许可一览（务必阅读）** |
+| `licenses/` | 第三方协议全文：`GPL-3.0.txt`、`MIT-Stichoza.txt` |
 
 ## 快速开始
 
@@ -25,6 +27,20 @@
   9 个谷歌域名随机轮换 + 失败整轮重试，**实测成功率约 90%**，且对 MTool 返回格式完全兼容。
 - **必应代理修复**：① 修复 POST 请求体转发导致的 500；② 上游域名由 `www.bing.com`
   改为 `cn.bing.com`（前者翻译接口返回空响应）。
+
+## 开源许可与致谢
+
+本目录代码参考 / 衍生自开源项目，已按其协议合规标注，**完整说明见
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)**：
+
+- `_worker.js` 衍生自 [jonssonyan/cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy)，
+  采用 **GPL-3.0**（文件头已保留原作者署名、标注修改内容，协议全文见 `licenses/GPL-3.0.txt`）。
+- 谷歌代理的 tk 签名算法参考 MIT 协议的
+  [Stichoza/google-translate-php](https://github.com/Stichoza/google-translate-php)
+  （Copyright © 2013 Levan Velijanashvili），为独立 JS 实现；抗限流工程思路致谢
+  [UniClawAI/google_translate](https://github.com/UniClawAI/google_translate)（该仓库无 LICENSE，仅思路参考）。
+
+> 注意：`_worker.js` 因 GPL-3.0 具有 Copyleft 传染性，再分发或衍生须继续以 GPL-3.0 开源并提供源码。
 
 ## 注意
 
