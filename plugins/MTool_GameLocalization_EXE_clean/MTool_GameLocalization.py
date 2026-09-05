@@ -4,6 +4,18 @@ MTool 万能游戏本地化 - SExtractor 原生桥接版
 直接使用随插件打包的 SExtractor src 引擎模块。
 """
 import os, re, sys, json, ast, threading, traceback, importlib, types, pathlib, tempfile, shutil, subprocess, csv, urllib.request
+
+def _norm_rpgmv_ctrl(s):
+    """剥 RPG Maker MV/MZ 文本控制码（\\V[n]、\\C[n]、\\I[n]、\\n<…> 等）。
+    提到模块级，避免类加载顺序问题。"""
+    if not isinstance(s, str):
+        return s
+    s = re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]\s*\[\s*\d+\s*\]", "", s)
+    s = re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]", "", s)
+    s = re.sub(r"\\n<[^>]+>", "", s)
+    s = re.sub(r"\\[<>.\\|!~$?#* ]", "", s)
+    return s.strip()
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
@@ -49,16 +61,29 @@ def _ensure_runtime_imports():
         except Exception:
             pass
 
-_ensure_runtime_imports()
+# SExtractor 运行时（var_extract / helper_write / common）懒加载：
+# helper_write 顶层 import pandas（约 280ms），只有真正执行提取时才需要，
+# 放到首次使用时再导入，避免拖慢主程序启动。
+EXVAR = None
+replaceOrig = None
+common = None
+_RUNTIME_READY = False
 
-try:
-    from var_extract import gExtractVar as EXVAR
-    from helper_write import replaceOrig
-    import common
-except Exception:
-    EXVAR = None
-    replaceOrig = None
-    common = None
+def _ensure_runtime():
+    """首次需要提取功能时才加载 SExtractor 运行时。返回是否加载成功。"""
+    global EXVAR, replaceOrig, common, _RUNTIME_READY
+    if _RUNTIME_READY:
+        return EXVAR is not None
+    _RUNTIME_READY = True
+    _ensure_runtime_imports()
+    try:
+        from var_extract import gExtractVar as _EXVAR
+        from helper_write import replaceOrig as _replaceOrig
+        import common as _common
+        EXVAR, replaceOrig, common = _EXVAR, _replaceOrig, _common
+    except Exception:
+        EXVAR = replaceOrig = common = None
+    return EXVAR is not None
 
 def _decode_ini_value(v):
     v = v.strip()
@@ -395,6 +420,102 @@ def _patch_dotnet_us_heap(dll_path, translations, max_report=30):
     return rep
 
 
+def _patch_serialized_text_blobs(asset_path, translations, max_report=30):
+    """Unity 序列化资源里“无定位对白”的长度前缀原位覆写。
+
+    背景：结构化解析失败的 MonoBehaviour（缺 typetree / ttgen 也拿不到）常把整段对白
+    存成 int32 小端长度 + UTF-8/UTF-16 的串。提取时二进制补扫（_scan_prefixed）能把这些
+    串捞进翻译表，但因为没解析出对象，写回阶段拿不到 file/path_id/field 定位，只能干看着
+    ——这正是“翻了几千条只写回几十处”的根因。
+
+    这里在输出副本上对每个文件再扫一遍长度前缀窗口，双重锚定（前缀长度合法 且 内容恰好
+    解码等于某条原文）才写：译文字节 ≤ 原串则原位覆写并补空格到等长——前缀不动、总长不变，
+    序列化偏移完全安全，等价于 DLL #US 的等长覆写；译文更长则跳过（交给运行时方案兜底）。
+    """
+    rep = {"replaced": 0, "skipped": 0, "skipped_samples": [], "changed": False}
+    try:
+        with open(asset_path, "rb") as f:
+            data = bytearray(f.read())
+    except Exception as e:
+        rep["error"] = f"{type(e).__name__}: {e}"
+        return rep
+    n = len(data)
+    i = 0
+    replaced = skipped = 0
+    samples = []
+
+    def _sample(label, text):
+        if len(samples) < max_report:
+            samples.append("[" + label + "]" + text[:36])
+
+    while i + 4 <= n:
+        ln = int.from_bytes(data[i:i + 4], 'little')
+        if 1 <= ln <= 8192 and i + 4 + ln <= n:
+            b = bytes(data[i + 4:i + 4 + ln])
+            s = None
+            enc = None
+            try:
+                s = b.decode('utf-8')
+                enc = 'utf-8'
+            except Exception:
+                try:
+                    s = b.decode('utf-16-le')
+                    enc = 'utf-16-le'
+                except Exception:
+                    s = None
+            if s is not None and not (enc == 'utf-16-le' and (len(b) % 2)):
+                t = translations.get(s)
+                if isinstance(t, str) and t and t != s:
+                    # 与 DLL #US 一致的保护：纯 ASCII / 标识符 / 无标点短词是
+                    # 对象名或查找键，写翻译会破坏 Find/回调 → 一律不写。
+                    if s.isascii() or _ASCII_IDENT_RE.fullmatch(s) or _SHORT_WORD_RE.fullmatch(s.strip()):
+                        skipped += 1
+                        _sample("标识符/短词", s)
+                    elif enc == 'utf-8':
+                        tb = t.encode('utf-8')
+                        if len(tb) <= ln:
+                            data[i + 4:i + 4 + ln] = tb + b'\x20' * (ln - len(tb))
+                            replaced += 1
+                        else:
+                            skipped += 1
+                            _sample("译文过长", s)
+                    else:  # utf-16-le：等码元覆写，补 U+0020 到等长
+                        tb = t.encode('utf-16-le')
+                        if len(tb) <= ln:
+                            data[i + 4:i + 4 + ln] = tb + b'\x20\x00' * ((ln - len(tb)) // 2)
+                            replaced += 1
+                        else:
+                            skipped += 1
+                            _sample("译文过长", s)
+        i += 1
+    if replaced:
+        try:
+            with open(asset_path, "wb") as f:
+                f.write(bytes(data))
+            rep["changed"] = True
+        except Exception as e:
+            rep["error"] = f"写入失败 {type(e).__name__}: {e}"
+    rep["replaced"] = replaced
+    rep["skipped"] = skipped
+    rep["skipped_samples"] = samples
+    return rep
+
+
+# 部分汉化流程会把原文换行(\n / \r\n)写成“换行占位标记”以便过模型，例如 〔NL0〕、
+# 〔NL0]、[NL0]、〔NL1〕。这些标记在原文数据里并不存在，若原样写回，游戏会把它们当
+# 普通字符显示出来（表现为文本里冒出 〔NL0] / 〔NL1] / [NLO] 之类）。写回时统一还原成换行。
+_NL_MARKER_RE = re.compile(r'[〔\[]\s*NL\s*[A-Za-z0-9]+\s*[\]〕]')
+
+
+def _sanitize_translations(translations):
+    """就地清理翻译表：仅改写“含换行占位标记”的译文字符串，_mtool_meta 等不受影响。"""
+    if isinstance(translations, dict):
+        for k, v in list(translations.items()):
+            if isinstance(v, str) and _NL_MARKER_RE.search(v):
+                translations[k] = _NL_MARKER_RE.sub('\n', v)
+    return translations
+
+
 class UnityPyBackend:
     """Unity 主后端：可选 UnityPy 结构化解析。
     目标：优先读取 SerializedFile / AssetBundle 中的 TextAsset、MonoBehaviour、脚本化对象，
@@ -557,16 +678,23 @@ class UnityPyBackend:
                 added += 1
             stat["dll_strings"] = stat.get("dll_strings", 0) + added
 
-    def extract(self, root, progress=None):
+    def extract(self, root, progress=None, filter_enabled=None, filter_mode=None):
         if not self.available:
             raise RuntimeError("UnityPy 未安装：" + (self.error or "unknown error"))
+        # 以本次 UI 设置为准；旧版本这里固定使用初始化时的过滤配置，
+        # 导致用户关闭过滤后 UnityPy 仍会过滤掉真实对白。
+        if filter_enabled is not None:
+            self.filter_enabled = bool(filter_enabled)
+        if filter_mode is not None:
+            self.filter_mode = filter_mode
         result={}
         locations={}
         errors=[]
         files=self._candidate_files(root)
         parsed_objects=0
         filtered=0
-        stat_extra={"filtered":0,"dll_strings":0}
+        mb_unparsed=0  # 结构化解析失败（缺 typetree 且 ttgen 也拿不到）的 MonoBehaviour 数
+        stat_extra={"filtered":0,"dll_strings":0,"filter_reasons":{},"errors":[]}
         # 预热 typetree 生成器（需要游戏 Managed 目录）
         managed=self._managed_dir(root)
         if managed:
@@ -594,9 +722,9 @@ class UnityPyBackend:
                             try: vals.extend(self._walk_strings(obj.parse_as_dict(), limit=20))
                             except Exception: pass
                     else:
-                        vals=[]
+                        vals=[]; parsed_ok=False
                         try:
-                            vals=self._walk_strings(obj.parse_as_dict(), limit=300)
+                            vals=self._walk_strings(obj.parse_as_dict(), limit=300); parsed_ok=True
                         except Exception:
                             pass
                         if not vals and typ == "MonoBehaviour":
@@ -604,9 +732,12 @@ class UnityPyBackend:
                             nodes=self.ttgen.nodes_for_object(obj)
                             if nodes:
                                 try:
-                                    vals=self._walk_strings(obj.read_typetree(nodes), limit=300)
+                                    vals=self._walk_strings(obj.read_typetree(nodes), limit=300); parsed_ok=True
                                 except Exception:
                                     vals=[]
+                            if not parsed_ok:
+                                # 结构化通道彻底拿不到——对白常锁在这类 MB 里，记数以便补跑二进制扫描
+                                mb_unparsed += 1
                     for field,text in vals:
                         if field == 'm_Name':
                             continue  # 对象名是逻辑标识符（Find/引用按名字），翻译会导致空引用崩溃
@@ -629,27 +760,247 @@ class UnityPyBackend:
             self._extract_dll_strings(root, result, locations, stat_extra)
         except Exception as e:
             errors.append(f"Managed DLL 字符串提取失败: {type(e).__name__}: {e}")
+        # 散落文本文件（StreamingAssets/游戏目录下的 json/csv/txt/utf16 等）：
+        # UnityPy 只覆盖序列化资源，这些文件传统深度扫描通道才认得——此前在
+        # UnityPy 可用时被整体跳过，导致明文散落文本全部漏扫。
+        text_scanned = 0
+        try:
+            text_scanned = self._extract_text_files(root, result, stat_extra)
+        except Exception as e:
+            errors.append(f"散落文本扫描失败: {type(e).__name__}: {e}")
+        # 无 typetree 的 MonoBehaviour（Utage/宴 等自定义剧本组件常见）解析不出——
+        # 对已列入候选的结构化序列化文件补跑一次二进制字符串扫描（Unity 长度前缀
+        # UTF-8/UTF-16 通道），把锁在里面的对白捞出来。显式跳过 .resS/.resource
+        # 纯资源流与超大文件，避免扫 1GB 音画流的无谓耗时与噪声。仅在确有解析失败
+        # 时触发：完全解析成功的游戏不跑，免得引入二进制扫描噪声。
+        unity_bin_scanned = 0
+        if mb_unparsed > 0:
+            try:
+                unity_bin_scanned = self._scan_unity_serialized(files, result, stat_extra)
+            except Exception as e:
+                errors.append(f"Unity 序列化补扫失败: {type(e).__name__}: {e}")
+        # UnityPy 对某些自定义 MonoBehaviour / Bundle 只能看到少量对象时，
+        # 立即补跑深度扫描。否则“UnityPy 成功”会阻止传统扫描兜底，最终可能只剩 0~1 条。
+        if len(result) <= 1:
+            try:
+                fallback_stat = UnityDeepExtractor.scan(
+                    root, result, min_len=2,
+                    filter_enabled=self.filter_enabled,
+                    filter_mode=self.filter_mode,
+                    progress=progress, deep=True)
+                errors.extend(fallback_stat.get("errors", []))
+                stat_extra["fallback_scanned"] = True
+                stat_extra["fallback_items"] = fallback_stat.get("items", 0)
+            except Exception as e:
+                errors.append(f"Unity 深度兜底失败: {type(e).__name__}: {e}")
         meta={"engine":"unity","backend":"UnityPy","locations":locations,"parsed_objects":parsed_objects}
         if self.ttgen.gen is None and self.ttgen.error:
             meta["ttgen"]="不可用（"+self.ttgen.error+"）；MonoBehaviour 解析受限"
         result["_mtool_meta"]=meta
+        errors.extend(stat_extra.get("errors",[]))
         stat={"files":len(files),"items":len(result)-1 if "_mtool_meta" in result else len(result),
               "filtered":filtered+stat_extra.get("filtered",0),"errors":errors,"backend":"UnityPy",
-              "locations":locations,"parsed_objects":parsed_objects,"dll_strings":stat_extra.get("dll_strings",0)}
+              "filter_reasons":stat_extra.get("filter_reasons",{}),
+              "locations":locations,"parsed_objects":parsed_objects,"dll_strings":stat_extra.get("dll_strings",0),
+              "text_files_scanned":text_scanned,"mb_unparsed":mb_unparsed,"unity_bin_scanned":unity_bin_scanned}
         return result,stat
 
-    def _replace_in_value(self, value, translations, changed, path=""):
+    def _scan_unity_serialized(self, files, result, stat):
+        """对已列入候选的结构化序列化文件补跑二进制字符串扫描，恢复锁在无 typetree
+        的 MonoBehaviour 里的文本（Utage/宴 剧本等）。跳过 .resS/.resource 纯资源流
+        与 >256MB 的大文件，只扫 .assets/level*/globalgamemanagers 这类小体积结构化档。
+        只跑 prefixed 通道：runs/utf16 在结构化序列化数据上几乎全是把 ASCII 误读成
+        UTF-16 的乱码（实测 5000 条里仅 ~24 条真日文），会严重污染翻译表。"""
+        scanned = 0
+        for fp in files:
+            low = os.path.basename(fp).lower()
+            if low.endswith(('.ress', '.resource')):
+                continue  # 纯资源流（音频/贴图/视频），无结构化文本，且动辄上 GB
+            try:
+                if os.path.getsize(fp) > 256 * 1024 * 1024:
+                    continue
+            except OSError:
+                continue
+            UnityDeepExtractor._scan_binary_file(fp, result, 2, self.filter_enabled, self.filter_mode, stat,
+                                                 channels=('prefixed',), require_jp=True)
+            scanned += 1
+        return scanned
+
+    # 散落文本文件：仅扫"数据型"文本扩展名；代码/网页类（.js/.lua/.html…）不进翻译表
+    SCATTERED_TEXT_EXTS = {'.txt', '.json', '.csv', '.tsv', '.xml', '.yaml', '.yml',
+                           '.ini', '.cfg', '.conf', '.bytes', '.lang', '.loc', '.locale'}
+    SCATTERED_SKIP_FILES = {'output_log.txt', 'player.log', 'player-prev.log',
+                            'error.log', 'boot.config', 'global-metadata.dat'}
+    SCATTERED_SKIP_DIRS = {'_mtool_output', '_data_backup', '_font_backup', '__pycache__',
+                           '.git', 'logs', 'crash', 'crashes', 'save', 'saves', 'savedata'}
+    # 回写只允许这几种：格式化安全（json结构化 / 整行精确替换）
+    SCATTERED_INJECT_EXTS = {'.json', '.txt', '.csv', '.tsv', '.bytes'}
+    _STRIP_INVISIBLE = '\ufeff\x00\r\n\t \u200b\u200c\u200d\u2060\u00ad'
+
+    def _extract_text_files(self, root, result, stat):
+        scanned = 0
+        for dp, dirs, fs in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in self.SCATTERED_SKIP_DIRS and not d.startswith('.')]
+            for fn in fs:
+                if fn.lower() in self.SCATTERED_SKIP_FILES:
+                    continue
+                ext = os.path.splitext(fn.lower())[1]
+                if ext not in self.SCATTERED_TEXT_EXTS:
+                    continue
+                fp = os.path.join(dp, fn)
+                try:
+                    if os.path.getsize(fp) > 64 * 1024 * 1024:
+                        continue
+                except OSError:
+                    continue
+                before = len(result)
+                UnityDeepExtractor._scan_text_file(fp, result, 2, self.filter_enabled,
+                                                   self.filter_mode, stat)
+                scanned += 1
+                _ = before
+        return scanned
+
+    def _inject_text_files(self, out_dir, translations, errors):
+        """散落文本文件的安全写回：json 走结构化值替换（不碰键名），其余只做
+        整行精确替换；匹配键与提取侧同一套剥离规则，保证回写命中。"""
+        total = 0
+        for dp, dirs, fs in os.walk(out_dir):
+            dirs[:] = [d for d in dirs if d.lower() not in self.SCATTERED_SKIP_DIRS and not d.startswith('.')]
+            for fn in fs:
+                ext = os.path.splitext(fn.lower())[1]
+                if ext not in self.SCATTERED_INJECT_EXTS:
+                    continue
+                fp = os.path.join(dp, fn)
+                try:
+                    if os.path.getsize(fp) > 16 * 1024 * 1024:
+                        continue
+                    with open(fp, 'rb') as f:
+                        raw = f.read()
+                    # 编码探测与提取侧 _scan_text_file 对齐：UTF-16(BOM) 文本若硬按
+                    # utf-8 解码会整文件 UnicodeDecodeError，导致该文件可翻行全部漏写。
+                    has_bom = raw.startswith(b'\xef\xbb\xbf')
+                    has_bom16 = raw[:2] in (b'\xff\xfe', b'\xfe\xff')
+                    nul_density = (raw.count(0) / len(raw)) if raw else 0
+                    enc_order = ['utf-8-sig', 'utf-8']
+                    if has_bom16:
+                        enc_order.insert(0, 'utf-16')
+                    elif len(raw) % 2 == 0 and raw.count(0) >= max(4, len(raw) // 8):
+                        enc_order += ['utf-16-le', 'utf-16-be']
+                    enc_order += ['cp932', 'shift_jis', 'gbk', 'big5']
+                    text = None
+                    chosen_enc = None
+                    for enc in enc_order:
+                        try:
+                            t = raw.decode(enc)
+                            if UnityDeepExtractor._textish(t):
+                                text = t
+                                chosen_enc = enc
+                                break
+                        except Exception:
+                            pass
+                    if text is None:
+                        continue  # 识别不了编码的文件不碰，避免把二进制当文本写坏
+                    changed = 0
+                    if ext in ('.json', '.bytes') and text.lstrip()[:1] in ('{', '['):
+                        try:
+                            obj = json.loads(text)
+                        except Exception:
+                            obj = None
+                        if obj is not None:
+                            changed = self._replace_json_values(obj, translations)
+                            if changed:
+                                with open(fp, 'w', encoding='utf-8') as f:
+                                    json.dump(obj, f, ensure_ascii=False, indent=2)
+                    else:
+                        lines = text.splitlines(keepends=True)
+                        out_lines = []
+                        for line in lines:
+                            body = line.rstrip('\r\n')
+                            eol = line[len(body):]
+                            key = body.strip(self._STRIP_INVISIBLE)
+                            dst = translations.get(key)
+                            if isinstance(dst, str) and dst and dst != key:
+                                out_lines.append(dst + eol)
+                                changed += 1
+                            else:
+                                out_lines.append(line)
+                        if changed:
+                            # 按原编码回写：BOM/无 BOM 保持一致；先整段编码成功再落盘，
+                            # 防止目标编码收不下译文时把文件截成空。
+                            if chosen_enc == 'utf-8-sig' and not has_bom:
+                                out_enc = 'utf-8'
+                            else:
+                                out_enc = chosen_enc
+                            try:
+                                out_bytes = ''.join(out_lines).encode(out_enc)
+                            except Exception:
+                                out_bytes = None
+                            if out_bytes is None:
+                                errors.append(f"{os.path.relpath(fp, out_dir)}: 译文含 {out_enc} 无法表示的字符，已跳过")
+                            else:
+                                with open(fp, 'wb') as f:
+                                    f.write(out_bytes)
+                    total += changed
+                except Exception as e:
+                    errors.append(f"{os.path.relpath(fp, out_dir)}: 散落文本回写失败 {type(e).__name__}: {e}")
+        return total
+
+    @staticmethod
+    def _replace_json_values(obj, translations):
+        """只替换 JSON 的字符串"值"，绝不改键名/结构；自引用防护64层。
+        回退匹配：先做严格查，命中失败再用 _norm_rpgmv_ctrl 剥控制码再查。"""
+        n = 0
+        STRIP = '\ufeff\x00\r\n\t \u200b\u200c\u200d\u2060\u00ad'
+        def walk(o, depth=0):
+            nonlocal n
+            if depth > 64 or not isinstance(o, (dict, list)):
+                return
+            if isinstance(o, dict):
+                for k in list(o.keys()):
+                    v = o[k]
+                    if isinstance(v, str):
+                        stripped = v.strip(STRIP)
+                        dst = translations.get(stripped)
+                        if not (isinstance(dst, str) and dst and dst != v):
+                            norm = _norm_rpgmv_ctrl(stripped)
+                            if norm != stripped:
+                                dst = translations.get(norm)
+                        if isinstance(dst, str) and dst and dst != v:
+                            o[k] = dst
+                            n += 1
+                    else:
+                        walk(v, depth + 1)
+            else:
+                for i in range(len(o)):
+                    v = o[i]
+                    if isinstance(v, str):
+                        stripped = v.strip(STRIP)
+                        dst = translations.get(stripped)
+                        if not (isinstance(dst, str) and dst and dst != v):
+                            norm = _norm_rpgmv_ctrl(stripped)
+                            if norm != stripped:
+                                dst = translations.get(norm)
+                        if isinstance(dst, str) and dst and dst != v:
+                            o[i] = dst
+                            n += 1
+                    else:
+                        walk(v, depth + 1)
+        walk(obj)
+        return n
+
+    def _replace_in_value(self, value, translations, changed, path="", depth=0):
+        if depth>64: return value  # 自引用/超深结构防护
         if isinstance(value, str):
             if value in translations and isinstance(translations[value], str) and translations[value] and translations[value] != value:
                 changed.append((path,value,translations[value])); return translations[value]
             return value
         if isinstance(value, dict):
             for k in list(value.keys()):
-                value[k]=self._replace_in_value(value[k],translations,changed,f"{path}.{k}" if path else str(k))
+                value[k]=self._replace_in_value(value[k],translations,changed,f"{path}.{k}" if path else str(k),depth+1)
             return value
         if isinstance(value, list):
             for i in range(len(value)):
-                value[i]=self._replace_in_value(value[i],translations,changed,f"{path}[{i}]")
+                value[i]=self._replace_in_value(value[i],translations,changed,f"{path}[{i}]",depth+1)
             return value
         return value
 
@@ -824,8 +1175,47 @@ class UnityPyBackend:
                     progress(idx,max(1,len(files)),rel,local)
             except Exception as e:
                 errors.append(f"{rel}: UnityPy写回失败 {type(e).__name__}: {e}")
+        # 无定位对白原位覆写：结构化解析失败（缺 typetree）被二进制补扫捞出的串没有
+        # file/path_id/field 定位，对象通道够不着；这里按 int32 长度前缀精确锚定做等长
+        # 覆写。跳过纯资源流(.resS/.resource)与超大文件（与提取侧 _scan_unity_serialized 同界）。
+        blob_replaced = blob_skipped = 0
+        blob_skipped_samples = []
+        try:
+            for fp in files:
+                rel = os.path.relpath(fp, root).replace('\\', '/')
+                low = os.path.basename(fp).lower()
+                if low.endswith(('.ress', '.resource')):
+                    continue
+                try:
+                    if os.path.getsize(fp) > 128 * 1024 * 1024:
+                        continue
+                except OSError:
+                    continue
+                dst = os.path.join(out_dir, rel)
+                if not os.path.isfile(dst):
+                    continue
+                r = _patch_serialized_text_blobs(dst, translations)
+                blob_replaced += r.get("replaced", 0)
+                blob_skipped += r.get("skipped", 0)
+                for s in r.get("skipped_samples", []):
+                    if s not in blob_skipped_samples:
+                        blob_skipped_samples.append(s)
+                if r.get("error"):
+                    errors.append(f"{rel}: 资源串原位覆写失败 {r['error']}")
+        except Exception as e:
+            errors.append(f"资源串原位覆写失败: {type(e).__name__}: {e}")
+        changed_total += blob_replaced
+        # 散落文本文件回写（与提取侧 _extract_text_files 对应）：json结构化/整行精确替换
+        text_replaced = 0
+        try:
+            text_replaced = self._inject_text_files(out_dir, translations, errors)
+        except Exception as e:
+            errors.append(f"散落文本回写失败: {type(e).__name__}: {e}")
         return {"files":len(files),"replaced":changed_total,"errors":errors,"out_dir":out_dir,"backend":"UnityPy",
-                "dll_replaced":dll_replaced,"dll_skipped":dll_skipped,"dll_skipped_samples":dll_skipped_samples[:30]}
+                "dll_replaced":dll_replaced,"dll_skipped":dll_skipped,"dll_skipped_samples":dll_skipped_samples[:30],
+                "blob_replaced":blob_replaced,"blob_skipped":blob_skipped,
+                "blob_skipped_samples":blob_skipped_samples[:30],
+                "text_replaced":text_replaced}
 
 
 class AssetRipperBackend:
@@ -864,7 +1254,7 @@ class AssetRipperBackend:
         for base in (here, os.path.join(here,"tools"), os.path.join(here,"_AssetRipper"), os.path.join(here,"_tools")):
             for n in AssetRipperBackend.EXE_NAMES:
                 candidates.append(os.path.join(base,n))
-        which=subprocess.run(["where","AssetRipper.exe"],capture_output=True,text=True) if os.name=='nt' else None
+        which=subprocess.run(["where","AssetRipper.exe"],capture_output=True,text=True,encoding="utf-8",errors="replace") if os.name=='nt' else None
         if which and which.returncode==0:
             candidates.extend([x.strip() for x in which.stdout.splitlines() if x.strip()])
         for p in candidates:
@@ -886,7 +1276,7 @@ class AssetRipperBackend:
         last = ""
         for cmd in commands:
             try:
-                cp=subprocess.run(cmd,capture_output=True,text=True,timeout=timeout)
+                cp=subprocess.run(cmd,capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=timeout)
             except Exception as e:
                 last=str(e); continue
             if cp.returncode==0:
@@ -929,7 +1319,7 @@ class UnityBackendManager:
     def extract(self, root, backend="自动", filter_enabled=True, filter_mode="标准", progress=None):
         if backend in ("自动","UnityPy") and self.unitypy.available:
             try:
-                r,st=self.unitypy.extract(root,progress=progress)
+                r,st=self.unitypy.extract(root,progress=progress,filter_enabled=filter_enabled,filter_mode=filter_mode)
                 # UnityPy 有结构化结果就直接采用；只在确实没有对象时继续 fallback。
                 if st.get("items",0)>0 or backend=="UnityPy":
                     return r,st
@@ -1046,7 +1436,7 @@ class UnityDeepExtractor:
         '.po','.lang','.loc','.locale','.bytes','.asset','.lua','.js','.mjs','.ts',
         '.text','.template','.html','.htm','.md','.properties'
     }
-    BINARY_EXTS = {'.assets','.ress','.resource','.bundle','.unity3d','.sharedassets','.data','.dat','.level'}
+    BINARY_EXTS = {'.assets','.ress','.resource','.bundle','.unity3d','.sharedassets','.data','.dat','.level','.bin'}
     SKIP_DIRS = {'_mtool_output','_data_backup','_font_backup','__pycache__','.git','logs','crash','crashes','save','saves','savedata'}
     SKIP_FILES = {'output_log.txt','player.log','player-prev.log','error.log','boot.config','global-metadata.dat'}
 
@@ -1095,6 +1485,10 @@ class UnityDeepExtractor:
                 except OSError:
                     continue
                 ext=os.path.splitext(low)[1]
+                # 通用名 .bin 纳入二进制扫描，但限制体积——大 .bin 多为整包资源，
+                # 三通道扫描耗时且收益低；16MB 内的才值得探测嵌入字符串。
+                if ext == '.bin' and size > 16*1024*1024:
+                    continue
                 interesting=(ext in cls.TEXT_EXTS or ext in cls.BINARY_EXTS or
                              low.endswith('_data') or low in ('globalgamemanagers','main data'))
                 if interesting:
@@ -1132,6 +1526,10 @@ class UnityDeepExtractor:
     @staticmethod
     def _textish(t):
         if not t: return False
+        # 零宽/格式字符不计入可打印率：一个U+200B不该让整份脚本文件被判为二进制
+        t = t.replace('\u200b','').replace('\u200c','').replace('\u200d','') \
+             .replace('\u2060','').replace('\u00ad','')
+        if not t: return False
         printable=sum(1 for c in t if c.isprintable() or c in '\r\n\t')
         return printable/max(1,len(t)) >= 0.92
 
@@ -1143,11 +1541,23 @@ class UnityDeepExtractor:
                 '/resources.assets' in path or '/sharedassets' in path or
                 low.endswith(('.assets','.ress','.resource','.bundle','.unity3d')))
 
+    @staticmethod
+    def _has_kana(text):
+        """是否含日文假名（平/片假名、半角片假名）。ASCII 路径、编号，以及把 ASCII
+        误读成 UTF-16 的 CJK 区乱码（敳潵牣…）都不含假名，靠它挡掉——真实日文对白
+        几乎必有假名（助词/送假名/语尾），是强信号。"""
+        return any(('぀'<=c<='ヿ') or ('ｦ'<=c<='ﾟ') or c in '々〆゛゜ゝゞー'
+                   for c in text)
+
     @classmethod
-    def _add(cls, text, result, min_len, filter_enabled, filter_mode, stat):
+    def _add(cls, text, result, min_len, filter_enabled, filter_mode, stat, require_jp=False):
         if not isinstance(text,str): return
-        text=text.strip('\ufeff\x00\r\n\t ')
+        # 剥离零宽字符/软连字符等格式字符：这类字符常用于隐形文本，且会干扰
+        # 可打印率判断与译文精确匹配；剥离后再进翻译表。
+        text=text.strip('﻿\x00\r\n\t ​‌‍⁠­')
         if len(text)<min_len: return
+        if require_jp and not cls._has_kana(text):
+            return  # 只收日文(含假名)——结构化补扫通道里 ASCII 路径/UTF-16乱码非翻译目标
         ok=True; reasons=[]
         if filter_enabled:
             ok,_,reasons=TextQualityFilter.accept(text,filter_mode)
@@ -1165,7 +1575,18 @@ class UnityDeepExtractor:
         except Exception as e:
             stat['errors'].append(f'{os.path.basename(fp)}: {e}'); return
         decs=[]
-        for enc in ('utf-8-sig','utf-8','utf-16-le','utf-16-be','cp932','shift_jis','gbk','big5'):
+        # 编码探测顺序：UTF-16 必须"有 BOM 或 NUL 密度达标"才尝试——
+        # 否则偶数长度的 SJIS/GBK 文件会被 UTF-16 解码成"可打印假名乱码"并抢先命中。
+        has_bom = raw[:2] in (b'\xff\xfe', b'\xfe\xff')
+        nul_density = (raw.count(0) / len(raw)) if raw else 0
+        try_utf16 = has_bom or (len(raw) % 2 == 0 and raw.count(0) >= max(4, len(raw) // 8))
+        enc_order = ['utf-8-sig', 'utf-8']
+        if has_bom:
+            enc_order.insert(0, 'utf-16')
+        elif try_utf16:
+            enc_order += ['utf-16-le', 'utf-16-be']
+        enc_order += ['cp932', 'shift_jis', 'gbk', 'big5']
+        for enc in enc_order:
             try:
                 t=raw.decode(enc)
                 if UnityDeepExtractor._textish(t):
@@ -1211,8 +1632,13 @@ class UnityDeepExtractor:
                     cls._walk_json(v,result,min_len,filter_enabled,filter_mode,stat,depth+1)
 
     @classmethod
-    def _scan_binary_file(cls, fp, result, min_len, filter_enabled, filter_mode, stat):
+    def _scan_binary_file(cls, fp, result, min_len, filter_enabled, filter_mode, stat,
+                          channels=('prefixed','runs','utf16'), require_jp=False):
         # 多通道：Unity 长度前缀 UTF-8/UTF-16 + 原始字符串窗口。
+        # channels 可裁剪通道——结构化 .assets 上 utf16/runs 通道几乎全是把 ASCII
+        # 误读成 UTF-16 的乱码（"Vertical"→"嘀牥楴慣l"），只留 prefixed 即可保住真对白。
+        # require_jp：只收日文(含假名)——结构化补扫的目标就是捞日文对白，ASCII 路径、
+        # 着色器名等非翻译目标不进来（也顺带挡掉 CJK 区误读乱码）。
         try:
             size=os.path.getsize(fp)
             with open(fp,'rb') as f:
@@ -1222,9 +1648,9 @@ class UnityDeepExtractor:
                     if not buf: break
                     data=overlap+buf
                     base=offset-len(overlap)
-                    cls._scan_prefixed(data,result,min_len,filter_enabled,filter_mode,stat)
-                    cls._scan_runs(data,result,min_len,filter_enabled,filter_mode,stat)
-                    cls._scan_utf16_runs(data,result,min_len,filter_enabled,filter_mode,stat)
+                    if 'prefixed' in channels: cls._scan_prefixed(data,result,min_len,filter_enabled,filter_mode,stat,require_jp)
+                    if 'runs' in channels: cls._scan_runs(data,result,min_len,filter_enabled,filter_mode,stat)
+                    if 'utf16' in channels: cls._scan_utf16_runs(data,result,min_len,filter_enabled,filter_mode,stat)
                     overlap=data[-512:]
                     offset += len(buf)
                     if size>0 and offset>size: break
@@ -1232,7 +1658,7 @@ class UnityDeepExtractor:
             stat['errors'].append(f'{os.path.basename(fp)}: {e}')
 
     @classmethod
-    def _scan_prefixed(cls,data,result,min_len,filter_enabled,filter_mode,stat):
+    def _scan_prefixed(cls,data,result,min_len,filter_enabled,filter_mode,stat,require_jp=False):
         n=len(data); i=0
         while i+4<=n:
             ln=int.from_bytes(data[i:i+4],'little')
@@ -1242,9 +1668,23 @@ class UnityDeepExtractor:
                     try:
                         s=b.decode(enc)
                         if len(s)>=min_len and cls._textish(s):
-                            cls._add(s,result,min_len,filter_enabled,filter_mode,stat); break
+                            cls._add(s,result,min_len,filter_enabled,filter_mode,stat,require_jp); break
                     except Exception: pass
             i+=1
+
+    @classmethod
+    def _run_text_ok(cls, s):
+        """原始二进制run通道的附加校验：随机高字节经cp932解码出的
+        '可打印假名/汉字乱码'必须挡掉，否则扫描纯随机二进制也会产出上万条
+        垃圾条目逐条送翻译API。规则：纯ASCII放行；含非ASCII时要求
+        假名计数>=2且占比>=12%（且长度>=6）或 CJK计数>=4且占比>=50%——
+        绝对计数门槛挡掉短随机 run 的比例波动。"""
+        if s.isascii(): return True
+        n=max(len(s),1)
+        kana=sum(1 for c in s if '\u3040'<=c<='\u30ff')
+        if kana>=2 and kana/n>=0.12 and n>=6: return True
+        cjk=sum(1 for c in s if '\u4e00'<=c<='\u9fff')
+        return cjk>=4 and cjk/n>=0.5
 
     @classmethod
     def _scan_runs(cls,data,result,min_len,filter_enabled,filter_mode,stat):
@@ -1254,46 +1694,99 @@ class UnityDeepExtractor:
                 cur.append(b)
             else:
                 # 原始二进制字符串扫描比长度前缀/文本文件更容易误收垃圾；ASCII/混合裸串提高最短长度。
-                if len(cur)>=max(8,min_len*2):
+                if len(cur)>=max(12,min_len*2):
                     try:
                         for enc in ('utf-8','cp932'):
                             try:
                                 s=bytes(cur).decode(enc).strip()
-                                if len(s)>=min_len and cls._textish(s):
+                                if len(s)>=min_len and cls._textish(s) and cls._run_text_ok(s):
                                     cls._add(s,result,min_len,filter_enabled,filter_mode,stat); break
                             except Exception: pass
                     finally: cur.clear()
                 else: cur.clear()
-        if len(cur)>=max(8,min_len*2):
+        if len(cur)>=max(12,min_len*2):
             for enc in ('utf-8','cp932'):
                 try:
                     s=bytes(cur).decode(enc).strip()
-                    if len(s)>=min_len and cls._textish(s): cls._add(s,result,min_len,filter_enabled,filter_mode,stat); break
+                    if len(s)>=min_len and cls._textish(s) and cls._run_text_ok(s): cls._add(s,result,min_len,filter_enabled,filter_mode,stat); break
                 except Exception: pass
 
     @classmethod
     def _scan_utf16_runs(cls,data,result,min_len,filter_enabled,filter_mode,stat):
-        # UTF-16LE/BE 连续可打印区，避免仅依赖 UTF-8。
-        for enc, zero_idx in (('utf-16-le',1),('utf-16-be',0)):
-            i=0; n=len(data); cur=bytearray()
+        # UTF-16LE/BE 连续文本 run：按 16位码元值判可打印性（旧"单字节为0"判据
+        # 对日文/中文全漏——CJK 码位>0x3000，LE 两字节均非零）。
+        # 歧义仲裁：同一字节区域会被 2端序×2相位 读出多种解码，按"文本质量分"
+        # （假名/ASCII/空白加权 + CJK）贪心保留最优解码，错位变体不进翻译表。
+        min_bytes=max(2,min_len)*2
+        n=len(data)
+        def _ok(c):
+            return (c in (9,10,13)) or (0x20<=c<=0x7E) or (0xA0<=c<=0xD7A3) or (0xFF61<=c<=0xFF9F)
+        def _q(s):
+            L=max(len(s),1)
+            kana=sum(1 for c in s if '\u3040'<=c<='\u30ff')
+            cjk=sum(1 for c in s if '\u4e00'<=c<='\u9fff')
+            asc=sum(1 for c in s if c.isascii() and (c.isalnum() or c==' '))
+            return (2.0*kana + 1.5*asc + 1.2*cjk)/L
+        candidates=[]  # (start, end, q, combo, s, anchored)
+        combos = (('utf-16-le',0),('utf-16-le',1),('utf-16-be',0),('utf-16-be',1))
+        for ci,(endian,phase) in enumerate(combos):
+            le = endian=='utf-16-le'
+            i=phase
             while i+1<n:
-                pair=data[i:i+2]
-                zero=pair[zero_idx]
-                other=pair[1-zero_idx]
-                if (32<=other<=126 or other>=0xA0 or other in (9,10,13)) and zero in (0,):
-                    cur.extend(pair); i+=2
+                c = data[i] | (data[i+1]<<8) if le else (data[i+1] | (data[i]<<8))
+                if _ok(c):
+                    j=i; cur=bytearray()
+                    kana_pairs=0; ascii_pairs=0; total_pairs=0
+                    while j+1<n:
+                        c2 = data[j] | (data[j+1]<<8) if le else (data[j+1] | (data[j]<<8))
+                        if not _ok(c2): break
+                        cur += data[j:j+2]; j+=2
+                        total_pairs+=1
+                        if 0x3040<=c2<=0x30FF: kana_pairs+=1
+                        elif 0x20<=c2<=0x7E: ascii_pairs+=1
+                    if len(cur)>=min_bytes:
+                        # 解码前快速预过滤：随机二进制会产生海量 CJK 垃圾 run，
+                        # 只值得解码的是 锚定 / 含假名 / 纯ASCII 三类
+                        start_ok = (i-2 >= 0 and data[i-2:i]==b'\x00\x00') or i==0
+                        end_ok = (j+2 > n) or (data[j:j+2]==b'\x00\x00')
+                        anchored = start_ok and end_ok
+                        if anchored or kana_pairs>=2 or ascii_pairs==total_pairs:
+                            try:
+                                s=bytes(cur).decode(endian).strip()
+                                if len(s)>=min_len and cls._textish(s):
+                                    candidates.append((i, j, _q(s), ci, s, anchored))
+                            except Exception: pass
+                    i=j if j>i else i+2
                 else:
-                    if len(cur)>=max(2,min_len)*2:
-                        try:
-                            s=bytes(cur).decode(enc).strip()
-                            if len(s)>=min_len and cls._textish(s): cls._add(s,result,min_len,filter_enabled,filter_mode,stat)
-                        except Exception: pass
-                    cur.clear(); i+=1
-            if len(cur)>=max(2,min_len)*2:
-                try:
-                    s=bytes(cur).decode(enc).strip()
-                    if len(s)>=min_len and cls._textish(s): cls._add(s,result,min_len,filter_enabled,filter_mode,stat)
-                except Exception: pass
+                    i+=2
+        # 全局组合裁决：错相位/错端序的"移位变体"与真文本内容密度完全相同，
+        # 逐条判不死；但真存储（NUL 终止/长度前缀）的双端锚定字节总量必然集中在
+        # 正确的 (端序,相位) 组合上——按组合的锚定字节总量选唯一赢家组合。
+        anchored_bytes={}
+        for i,j,q,ci,s,anchored in candidates:
+            if anchored:
+                anchored_bytes[ci]=anchored_bytes.get(ci,0)+(j-i)
+        if anchored_bytes:
+            win=max(anchored_bytes, key=lambda ci:(anchored_bytes[ci], -ci))
+            final=[c for c in candidates if c[3]==win and c[5]]
+        else:
+            final=candidates
+        final.sort(key=lambda t:(-t[2], -(t[1]-t[0]), t[3]))
+        taken=[]
+        for start,end,q,ci,s,anchored in final:
+            if any(start<b and end>a for a,b in taken):
+                continue
+            taken.append((start,end))
+            if anchored:
+                ok = cls._run_text_ok(s)
+            else:
+                # 无锚候选加严：没有 NUL 结构背书的纯 CJK UTF-16 run 极罕见
+                #（随机高字节恰好落进 CJK 区间即可伪造），要求假名占比达标
+                #（真日文文本假名占比普遍 >0.15，随机混入的远低于此）或纯 ASCII。
+                kana=sum(1 for c in s if '\u3040'<=c<='\u30ff')
+                ok = s.isascii() or (kana>=3 and kana/max(len(s),1)>=0.15)
+            if ok:
+                cls._add(s,result,min_len,filter_enabled,filter_mode,stat)
 
 class SExtractorHeadless:
     def __init__(self, runtime_dir=RUNTIME_DIR):
@@ -1348,7 +1841,7 @@ class SExtractorHeadless:
         return reg, extra
 
     def configure(self, engine_name, sample_override=None, encode_read=None, encode_write=None):
-        if EXVAR is None:
+        if not _ensure_runtime():
             raise RuntimeError("SExtractor 运行时加载失败")
         EXVAR.clearBeforeExtract()
         EXVAR.engineName = engine_name
@@ -1366,13 +1859,29 @@ class SExtractorHeadless:
                     v = int(v)
                 setattr(EXVAR, k, v)
         EXVAR.regDic = reg
+        # 决定读取编码：JSON 引擎（RPGMV/MZ、GalGame JSON 等）永远是 UTF-8，
+        # 用户在 UI 错选 cp932/shift_jis 会让 _prepare 直接 UnicodeDecodeError。
+        # 这里对 JSON fileType 强制优选 utf-8，并把用户的原始选择留作回退链兜底。
+        _single_byte_east_asia = {"cp932", "shift_jis", "gbk", "big5", "latin-1"}
         if encode_read:
-            EXVAR.OldEncodeName = encode_read
+            if EXVAR.fileType == "json" and encode_read.lower() in _single_byte_east_asia:
+                EXVAR._encode_read_fallback = encode_read  # 留给 _prepare() 的回退链
+                EXVAR.OldEncodeName = "utf-8"
+            else:
+                EXVAR._encode_read_fallback = None
+                EXVAR.OldEncodeName = encode_read
         elif EXVAR.fileType == "json":
+            EXVAR._encode_read_fallback = None
             EXVAR.OldEncodeName = "utf-8"
         else:
+            EXVAR._encode_read_fallback = None
             EXVAR.OldEncodeName = "cp932"
         EXVAR.NewEncodeName = encode_write or EXVAR.OldEncodeName
+        # 写回编码：JSON 引擎（RPGMV/MZ 等）也必须是 UTF-8，否则中文译文会 UnicodeEncodeError。
+        # 用户在 UI 选 cp932/shift_jis/gbk/big5 写 JSON 时强制改用 utf-8（cp932 不含汉字）。
+        _write_single_byte_east_asia = {"cp932", "shift_jis", "gbk", "big5", "latin-1"}
+        if EXVAR.fileType == "json" and (EXVAR.NewEncodeName or "").lower() in _write_single_byte_east_asia:
+            EXVAR.NewEncodeName = "utf-8"
         EXVAR.printSetting = [False, False, False, False, False]
         EXVAR.window = None
         EXVAR.transReplace = False
@@ -1416,6 +1925,44 @@ class SExtractorHeadless:
         EXVAR.listOrig.append(text)
         return True
 
+    @staticmethod
+    def _read_text_fallback(fp, primary, mode="r", **kw):
+        """按 primary 编码打开 fp 失败时依次回退到常见编码。
+        返回文本/字符串内容；最后兜底用 'utf-8' errors='replace' 避免再次炸异常。
+        仅供 _prepare() 在读取文本/JSON 文件时使用，不影响读二进制 bin。
+        """
+        try:
+            with open(fp, mode, encoding=primary, **kw) as f:
+                return f.read()
+        except (UnicodeDecodeError, LookupError):
+            # 二进制读，按列表顺序探测解码；优先 utf-8 系列（RPGMV JSON 几乎都是 utf-8）
+            with open(fp, "rb") as fb:
+                raw = fb.read()
+            for enc in ("utf-8-sig", "utf-8", primary, "cp932", "shift_jis", "gbk", "big5"):
+                try:
+                    return raw.decode(enc)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return raw.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _load_json_fallback(fp, primary):
+        """读 JSON：用户编码 → utf-8 等回退。返回 dict/list。"""
+        try:
+            with open(fp, "r", encoding=primary) as f:
+                return json.load(f)
+        except (UnicodeDecodeError, LookupError):
+            # JSON 严格，不允许 errors='replace' 当数据；走多编码探测
+            with open(fp, "rb") as fb:
+                raw = fb.read()
+            for enc in ("utf-8-sig", "utf-8", primary, "cp932", "shift_jis", "gbk", "big5"):
+                try:
+                    return json.loads(raw.decode(enc))
+                except (UnicodeDecodeError, LookupError, json.JSONDecodeError):
+                    continue
+            # 实在不行抛出原始 UnicodeDecodeError 让上层感知
+            raise
+
     def _prepare(self, fp):
         ftype = EXVAR.fileType
         EXVAR.clearBeforeParse()
@@ -1428,18 +1975,21 @@ class SExtractorHeadless:
                 with open(fp, "rb") as f:
                     content, inserts = EXVAR.readFileDataImp(f, EXVAR.contentSeparate)
             else:
-                with open(fp, "r", encoding=EXVAR.OldEncodeName) as f:
-                    content, inserts = EXVAR.readFileDataImp(f, EXVAR.contentSeparate)
+                # 文本读取：用户在 UI 选 cp932/shift_jis 等单字节编码，但文件实际是 UTF-8
+                # 时会 UnicodeDecodeError；这里加 utf-8 系列兜底，避免整批文件全军覆没
+                from io import StringIO
+                data = self._read_text_fallback(fp, EXVAR.OldEncodeName)
+                content, inserts = EXVAR.readFileDataImp(StringIO(data), EXVAR.contentSeparate)
             EXVAR.content, EXVAR.insertContent = content, inserts or {}
             return
         if ftype == "json":
-            with open(fp, "r", encoding=EXVAR.OldEncodeName) as f:
-                EXVAR.content = json.load(f)
+            # JSON 不允许 replace：UTF-8 文件在 cp932 下会 UnicodeDecodeError，统一走回退
+            EXVAR.content = self._load_json_fallback(fp, EXVAR.OldEncodeName)
             return
         if ftype == "txt":
-            with open(fp, "r", encoding=EXVAR.OldEncodeName, newline="") as f:
-                data = f.read()
-            if EXVAR.contentSeparate == "":
+            data = self._read_text_fallback(fp, EXVAR.OldEncodeName, newline="")
+            # contentSeparate 为 None/空 都按换行分行（None 时 re.split(None) 会崩）
+            if not EXVAR.contentSeparate:
                 parts = data.split("\r\n")
                 content = []
                 for part in parts:
@@ -1502,9 +2052,24 @@ class SExtractorHeadless:
             if 'game' in topdirs or any(n.endswith(('.rpy','.rpyc','.rpa')) for n in names): score += 60; reasons.append("Ren'Py game/脚本特征")
             score += min(25,8*int(ext.get('.rpy',0)>0)+8*int(ext.get('.rpa',0)>0)+5*int(ext.get('.rpyc',0)>0))
         elif engine_name == 'Unity':
+            # Unity 原生 Windows 游戏的最强指纹：主 EXE + UnityPlayer.dll。
+            # 仅靠 .ks/.txt/.ini 等后缀很容易被 SExtractor 的 RealLive 等规则误判。
+            has_unity_player = 'unityplayer.dll' in names
+            has_game_exe = any(n.endswith('.exe') and n != 'unitycrashhandler64.exe' for n in names)
+            if has_unity_player and has_game_exe:
+                score += 180; reasons.append('UnityPlayer.dll + 游戏 EXE 强特征')
+            elif has_unity_player:
+                score += 150; reasons.append('UnityPlayer.dll 强特征')
             if any(d.endswith('_data') or '/managed' in d or '/resources' in d for d in dirs) or any(n.endswith(('.assets','.bundle','.unity3d','.ress','.resource')) for n in names):
                 score += 90; reasons.append('Unity *_Data/assets/bundle 特征')
             if any('globalgamemanagers' in n for n in names): score += 20; reasons.append('globalgamemanagers')
+        elif engine_name == 'LiveMaker':
+            # LiveMaker/LiveNovel 的最强指纹是 .lsb 编译脚本；辅以 live.dll / .lpb 工程文件。
+            n_lsb = ext.get('.lsb', 0)
+            if n_lsb:
+                score += min(170, 70 + 20 * n_lsb); reasons.append(f'.lsb 脚本 ×{n_lsb}')
+            if any(n in names for n in ('live.dll', 'livemaker.exe')) or ext.get('.lpb', 0):
+                score += 45; reasons.append('LiveMaker 运行时特征')
         elif engine_name == "Unity_dat":
             if any(d.endswith('_data') or '/managed' in d or '/resources' in d for d in dirs) or any(n.endswith('.assets') for n in names):
                 score += 65; reasons.append("Unity *_Data/assets 特征")
@@ -1526,7 +2091,7 @@ class SExtractorHeadless:
         """自动识别最可能引擎：目录特征初筛 + 前几名真实试提取。"""
         if not os.path.isdir(root): return []
         fp=self._root_fingerprint(root); cand=[]
-        custom_names=['Unity']
+        custom_names=['Unity','LiveMaker']
         for name in custom_names:
             score,reasons=self._engine_heuristic_score(name,fp)
             if score>0: cand.append({'engine':name,'score':score,'reasons':reasons,'probe':0,'files':0})
@@ -1614,7 +2179,7 @@ class SExtractorHeadless:
         except XP3EncryptedError:
             tool=find_external_tool(os.path.dirname(xp3_path))
             if tool and os.path.basename(tool).lower() == 'krkrxp3.exe':
-                cp=subprocess.run([tool,'-m','extract',xp3_path,dst], capture_output=True, text=True, timeout=300)
+                cp=subprocess.run([tool,'-m','extract',xp3_path,dst], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300)
                 if cp.returncode==0:
                     return 'external'
             raise
@@ -1686,7 +2251,7 @@ class SExtractorHeadless:
                         tool=find_external_tool(os.path.dirname(xp3))
                         if not tool or os.path.basename(tool).lower()!='krkrxp3.exe': raise RuntimeError('外部XP3工具不可用')
                         os.makedirs(os.path.dirname(out_xp3),exist_ok=True)
-                        cp=subprocess.run([tool,'-m','repack',inject_root,out_xp3],capture_output=True,text=True,timeout=300)
+                        cp=subprocess.run([tool,'-m','repack',inject_root,out_xp3],capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=300)
                         if cp.returncode!=0: raise RuntimeError(cp.stderr[-500:] or cp.stdout[-500:] or 'krkrxp3重包失败')
                     else:
                         os.makedirs(os.path.dirname(out_xp3),exist_ok=True)
@@ -1703,7 +2268,224 @@ class SExtractorHeadless:
                 shutil.rmtree(work,ignore_errors=True)
         return {'files':len(xp3s),'replaced':total,'errors':errors,'out_dir':out_dir,'xp3':len(xp3s)}
 
+    # ==================== LiveMaker（.lsb 脚本，依赖 pylivemaker）====================
+    # LiveMaker/LiveNovel 的 .lsb 是编译字节码，自行解析不现实，桥接成熟库 pylivemaker：
+    #   提取：lmlsb extractcsv  → CSV(ID,Label,Context,Original text,Translated text)
+    #   回写：lmlsb insertcsv   （按 ID 匹配，原地改 .lsb）
+    #   归档：lmar x            （从 exe/dat 解出 .lsb；无 repack，走散装补丁）
+    # 与 Unity 一样属于“虚拟引擎”：不在 engine.ini 里，由 extract/inject 特判分派。
+
+    @staticmethod
+    def _livemaker_available():
+        try:
+            import livemaker  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _lsb_files(root):
+        out = []
+        for dp, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() not in {"_mtool_output", "_data_backup", "_font_backup", "__pycache__", ".git"}]
+            for fn in files:
+                if fn.lower().endswith('.lsb'):
+                    out.append(os.path.join(dp, fn))
+        return sorted(out)
+
+    @staticmethod
+    def _livemaker_pick_archive(root):
+        """游戏根目录里挑最可能的 LiveMaker 归档（exe/dat），按体积大优先。"""
+        cands = []
+        try:
+            for fn in os.listdir(root):
+                fp = os.path.join(root, fn)
+                if not os.path.isfile(fp):
+                    continue
+                low = fn.lower()
+                if (low.endswith('.exe') or low.endswith('.dat')) and low not in ('unins000.exe', 'unitycrashhandler64.exe'):
+                    try:
+                        sz = os.path.getsize(fp)
+                    except Exception:
+                        sz = 0
+                    cands.append((sz, fp))
+        except Exception:
+            pass
+        cands.sort(reverse=True)
+        return cands[0][1] if cands else None
+
+    @staticmethod
+    def _run_lm(tool, args, timeout=600):
+        """调用 pylivemaker CLI（tool 取 'lmlsb'/'lmar'）。用当前解释器 -c 载入库入口，
+        与运行环境一致，无需 PATH 里有 lmlsb.exe。返回 CompletedProcess。"""
+        cmd = [sys.executable, '-c', 'from livemaker.cli import %s; %s()' % (tool, tool)] + [str(a) for a in args]
+        return subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
+
+    def _lsb_extract_rows(self, lsb_path):
+        """对单个 .lsb 跑 lmlsb extractcsv，返回行 [[ID,Label,Context,Original,Translated],...]（去表头）。失败返回 None。"""
+        tmp = lsb_path + ".mtool_extract.csv"
+        try:
+            cp = self._run_lm('lmlsb', ['extractcsv', lsb_path, tmp, '-e', 'utf-8', '--overwrite'])
+            if cp.returncode != 0 or not os.path.isfile(tmp):
+                return None
+            rows = []
+            # 与 pylivemaker 完全一致的 open/csv 设置，保证往返格式兼容
+            with open(tmp, 'r', encoding='utf-8', newline='\n') as f:
+                reader = csv.reader(f, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+                for i, row in enumerate(reader):
+                    if not row:
+                        continue
+                    if i == 0 and row[0] == 'ID':  # 跳过表头
+                        continue
+                    rows.append((list(row) + ['', '', '', '', ''])[:5])
+            return rows
+        except Exception:
+            return None
+        finally:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _lsb_inject_one(self, lsb_path, translations):
+        """对单个 .lsb 回填译文：extractcsv 取带 ID 的原始行 → 按原文查表填“Translated text” → insertcsv 原地改。
+        返回 (回填条数, 错误信息或None)。"""
+        rows = self._lsb_extract_rows(lsb_path)
+        if rows is None:
+            return 0, "extractcsv 失败"
+        n = 0
+        for r in rows:
+            orig = r[3]
+            dst = translations.get(orig)
+            if isinstance(dst, str) and dst and dst != orig:
+                r[4] = dst
+                n += 1
+        if n == 0:
+            return 0, None
+        tmp = lsb_path + ".mtool_insert.csv"
+        try:
+            with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+                w = csv.writer(f, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+                w.writerow(["ID", "Label", "Context", "Original text", "Translated text"])
+                for r in rows:
+                    w.writerow(r)
+            cp = self._run_lm('lmlsb', ['insertcsv', lsb_path, tmp, '-e', 'utf-8', '--no-backup'])
+            if cp.returncode != 0:
+                return 0, (cp.stderr or cp.stdout or 'insertcsv 失败')[-300:]
+            return n, None
+        finally:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _livemaker_extract(self, root, progress=None, filter_enabled=True, filter_mode='标准'):
+        if not self._livemaker_available():
+            raise RuntimeError("未安装 pylivemaker。请在对话框点击「安装 pylivemaker」后重试。")
+        merged = {}
+        stat = {'files': 0, 'items': 0, 'filtered': 0, 'filter_reasons': {}, 'errors': [], 'backend': 'pylivemaker', 'warnings': []}
+        lsb_files = self._lsb_files(root)
+        tmp_extract = None
+        if not lsb_files:  # 无散装 .lsb：尝试从 exe/dat 归档解包
+            arc = self._livemaker_pick_archive(root)
+            if arc:
+                tmp_extract = tempfile.mkdtemp(prefix='mtool_lm_arc_')
+                cp = self._run_lm('lmar', ['x', arc, '-o', tmp_extract])
+                lsb_files = self._lsb_files(tmp_extract)
+                if not lsb_files:
+                    stat['errors'].append(f"归档 {os.path.basename(arc)} 未解出 .lsb：{(cp.stderr or cp.stdout or '')[-200:]}")
+        if not lsb_files:
+            if tmp_extract:
+                shutil.rmtree(tmp_extract, ignore_errors=True)
+            stat['warnings'].append("未找到 .lsb 脚本，也无法从 exe/dat 归档解出。请确认这是 LiveMaker 游戏。")
+            return merged, stat
+        try:
+            total = len(lsb_files)
+            for i, lsb in enumerate(lsb_files, 1):
+                rows = self._lsb_extract_rows(lsb)
+                if rows is None:
+                    stat['errors'].append(f"{os.path.basename(lsb)}: extractcsv 失败")
+                else:
+                    stat['files'] += 1
+                    for r in rows:
+                        orig = r[3]
+                        if not isinstance(orig, str) or not orig:
+                            continue
+                        if filter_enabled:
+                            ok, q, rs = TextQualityFilter.accept(orig, filter_mode)
+                            if not ok:
+                                stat['filtered'] += 1
+                                key = rs[0] if rs else '低可信度'
+                                stat['filter_reasons'][key] = stat['filter_reasons'].get(key, 0) + 1
+                                continue
+                        merged.setdefault(orig, "")
+                if progress:
+                    try:
+                        progress(i, total, os.path.basename(lsb), len(rows or []))
+                    except Exception:
+                        pass
+        finally:
+            if tmp_extract:
+                shutil.rmtree(tmp_extract, ignore_errors=True)
+        stat['items'] = len(merged)
+        return merged, stat
+
+    def _livemaker_inject(self, root, translations, out_dir=None, progress=None):
+        if not self._livemaker_available():
+            raise RuntimeError("未安装 pylivemaker。请在对话框点击「安装 pylivemaker」后重试。")
+        out_dir = out_dir or os.path.join(root, '_mtool_output')
+        os.makedirs(out_dir, exist_ok=True)
+        errors = []
+        warnings = []
+        total = 0
+        loose = self._lsb_files(root)
+        if loose:
+            # 情况A：散装 .lsb —— 复制整个游戏目录到输出，随后对副本里的 .lsb 打补丁（drop-in 汉化包）
+            for dp, dirs, files in os.walk(root):
+                rel = os.path.relpath(dp, root)
+                rel = '' if rel == '.' else rel
+                dirs[:] = [d for d in dirs if d.lower() not in {'_mtool_output', '_data_backup', '_font_backup', '__pycache__', '.git'}]
+                for fn in files:
+                    src = os.path.join(dp, fn)
+                    dst = os.path.join(out_dir, rel, fn)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception as e:
+                        errors.append(f'{os.path.relpath(src, root)}: 复制失败 {e}')
+            targets = self._lsb_files(out_dir)
+        else:
+            # 情况B：打包在 exe/dat —— 解包到输出目录，对解出的 .lsb 打补丁（LiveMaker 优先加载散装 .lsb）
+            arc = self._livemaker_pick_archive(root)
+            if not arc:
+                raise RuntimeError("未找到 .lsb，也未找到可解包的 LiveMaker 归档（exe/dat）。")
+            cp = self._run_lm('lmar', ['x', arc, '-o', out_dir])
+            targets = self._lsb_files(out_dir)
+            if not targets:
+                raise RuntimeError(f"解包归档失败或无 .lsb：{(cp.stderr or cp.stdout or '')[-300:]}")
+            warnings.append("文本打包在 exe/dat 中：已输出散装 .lsb 补丁，请把输出目录里的文件覆盖回游戏目录（LiveMaker 会优先加载散装 .lsb）。")
+        total_files = len(targets)
+        for i, lsb in enumerate(targets, 1):
+            n = 0
+            try:
+                n, err = self._lsb_inject_one(lsb, translations)
+                total += n
+                if err:
+                    errors.append(f'{os.path.basename(lsb)}: {err}')
+            except Exception as e:
+                errors.append(f'{os.path.basename(lsb)}: {type(e).__name__}: {e}')
+            if progress:
+                try:
+                    progress(i, total_files, os.path.basename(lsb), n)
+                except Exception:
+                    pass
+        return {'files': total_files, 'replaced': total, 'errors': errors, 'out_dir': out_dir, 'warnings': warnings}
+
     def extract(self, root, engine_name, sample_override=None, encode_read=None, progress=None, filter_enabled=True, filter_mode="标准", include_xp3=True):
+        if engine_name == 'LiveMaker':
+            return self._livemaker_extract(root, progress=progress, filter_enabled=filter_enabled, filter_mode=filter_mode)
         if engine_name == 'Unity':
             result, stat = self.unity_backends.extract(root, backend=getattr(self, 'unity_backend_mode', '自动'), filter_enabled=filter_enabled, filter_mode=filter_mode, progress=progress)
             return result, stat
@@ -1738,6 +2520,11 @@ class SExtractorHeadless:
         return result, {"files": len(files), "items": len(result), "filtered": filtered, "filter_reasons": filter_reasons, "errors": errors}
 
     def inject(self, root, engine_name, translations, out_dir=None, sample_override=None, encode_read=None, encode_write=None, progress=None, include_xp3=True):
+        # 写回前统一还原译文里的换行占位标记（〔NL0]/〔NL1] 等→\n），否则游戏会把
+        # 标记当正文显示。就地改写该次调用持有的翻译字典，写回产物即为最终形态。
+        _sanitize_translations(translations)
+        if engine_name == 'LiveMaker':
+            return self._livemaker_inject(root, translations, out_dir=out_dir, progress=progress)
         if engine_name == 'Unity':
             out_dir = out_dir or os.path.join(root, '_mtool_output')
             locs = None
@@ -1762,6 +2549,12 @@ class SExtractorHeadless:
                 for i in range(len(EXVAR.listOrig) - 1, -1, -1):
                     src = EXVAR.listOrig[i]
                     dst = translations.get(src)
+                    if dst is None:
+                        # 控码归一化后备匹配：处理 \V[\d+] \C[\d+] \n<…> 等差异
+                        # （抽出的 listOrig 保留原文控制码，123.json 等老翻译表 key 是剥净的）
+                        src_norm = self._norm_rpgmv_ctrl(src)
+                        if src_norm and src_norm != src:
+                            dst = translations.get(src_norm)
                     if not isinstance(dst, str) or not dst or dst == src:
                         continue
                     ok = module.replaceOnceImp(EXVAR.content, [EXVAR.listCtrl[i]], [dst])
@@ -1777,6 +2570,19 @@ class SExtractorHeadless:
             except Exception as e:
                 errors.append(f"{os.path.relpath(fp, root)}: {type(e).__name__}: {e}")
         return {"files": len(files), "replaced": total, "errors": errors, "out_dir": out_dir}
+
+    @staticmethod
+    def _norm_rpgmv_ctrl(s):
+        """剥掉 RPG Maker MV/MZ 文本控制码，便于和已剥干净的翻译字典 key 对齐匹配。
+        不剥 \\\\ 本身（保留原文中的反斜杠转义），不影响正常文本。"""
+        import re as _re
+        if not isinstance(s, str):
+            return s
+        s = _re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]\s*\[\s*\d+\s*\]", "", s)
+        s = _re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]", "", s)
+        s = _re.sub(r"\\n<[^>]+>", "", s)
+        s = _re.sub(r"\\[<>.\|!~\$?#* ]", "", s)
+        return s.strip()
 
     def _write(self, dst):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1862,7 +2668,7 @@ class UniversalDialog:
         self.detect_status=tk.StringVar(value="未识别")
         ttk.Button(detect_row,text="🤖 自动识别引擎",command=self.autodetect).pack(side=tk.LEFT)
         ttk.Label(detect_row,textvariable=self.detect_status,foreground="gray").pack(side=tk.LEFT,padx=8)
-        vals=["选择引擎", "Unity（深度提取）"]+[x[0] for x in bridge.list_engines()]
+        vals=["选择引擎", "Unity（深度提取）", "LiveMaker（LSB脚本）"]+[x[0] for x in bridge.list_engines()]
         self.ec=ttk.Combobox(frm,textvariable=self.engine,values=vals,state="readonly",width=42)
         self.ec.pack(fill=tk.X,pady=3); self.engine.set(vals[0])
         self.ec.bind("<<ComboboxSelected>>", lambda e: self.load_rule())
@@ -1876,6 +2682,12 @@ class UniversalDialog:
         ttk.Button(backend_row,text="检测后端",command=self.check_unity_backends).pack(side=tk.LEFT,padx=3)
         ttk.Button(backend_row,text="安装 UnityPy",command=self.install_unitypy).pack(side=tk.LEFT,padx=3)
         ttk.Button(backend_row,text="选择 AssetRipper",command=self.pick_assetripper).pack(side=tk.LEFT,padx=3)
+        lm_row=ttk.Frame(frm); lm_row.pack(fill=tk.X,pady=3)
+        ttk.Label(lm_row,text="LiveMaker",width=12).pack(side=tk.LEFT)
+        self.lm_status=tk.StringVar(value="未检测")
+        ttk.Label(lm_row,textvariable=self.lm_status,foreground="gray").pack(side=tk.LEFT,padx=8)
+        ttk.Button(lm_row,text="检测 pylivemaker",command=self.check_livemaker).pack(side=tk.LEFT,padx=3)
+        ttk.Button(lm_row,text="安装 pylivemaker",command=self.install_pylivemaker).pack(side=tk.LEFT,padx=3)
         ttk.Label(frm,text="SExtractor规则（可直接编辑；默认使用 engine.ini 内置规则）").pack(anchor=tk.W,pady=(6,2))
         self.rule=scrolledtext.ScrolledText(frm,height=8,wrap=tk.NONE)
         self.rule.pack(fill=tk.X,pady=(0,4))
@@ -2022,13 +2834,43 @@ class UniversalDialog:
         if messagebox.askyesno("安装 UnityPy", "将使用当前 Python 解释器执行 pip install UnityPy。\n需要网络连接。\n\n继续？", parent=self.win):
             def worker():
                 try:
-                    cp=subprocess.run([sys.executable,"-m","pip","install","-U","UnityPy"],capture_output=True,text=True,timeout=900)
+                    cp=subprocess.run([sys.executable,"-m","pip","install","-U","UnityPy"],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=900)
                     if cp.returncode!=0: raise RuntimeError((cp.stderr or cp.stdout)[-1800:])
                     importlib.invalidate_caches()
                     self.bridge.unity_backends.unitypy=UnityPyBackend()
                     self.win.after(0,lambda:(self.check_unity_backends(silent=True),messagebox.showinfo("完成","UnityPy 安装完成。",parent=self.win)))
                 except Exception as e:
-                    self.win.after(0,lambda:messagebox.showerror("安装失败",str(e),parent=self.win))
+                    self.win.after(0,lambda e=e:messagebox.showerror("安装失败",str(e),parent=self.win))
+            threading.Thread(target=worker,daemon=True).start()
+
+    def check_livemaker(self, silent=False):
+        try:
+            ok = self.bridge._livemaker_available()
+            ver = ""
+            if ok:
+                try:
+                    import livemaker
+                    ver = " " + getattr(livemaker, "__version__", "")
+                except Exception:
+                    pass
+            self.lm_status.set(("pylivemaker ✓" + ver) if ok else "pylivemaker ✗（未安装）")
+            if not silent:
+                messagebox.showinfo("LiveMaker 后端", "pylivemaker：%s" % ("已安装" + ver if ok else "未安装，点「安装 pylivemaker」自动安装"), parent=self.win)
+        except Exception as e:
+            self.lm_status.set("检测失败")
+            if not silent: messagebox.showerror("检测失败", str(e), parent=self.win)
+
+    def install_pylivemaker(self):
+        """在当前 MTool Python 环境安装 pylivemaker（提供 lmlsb/lmar 供 .lsb 提取与写回）。"""
+        if messagebox.askyesno("安装 pylivemaker", "将使用当前 Python 解释器执行 pip install pylivemaker。\n需要网络连接。\n\n继续？", parent=self.win):
+            def worker():
+                try:
+                    cp=subprocess.run([sys.executable,"-m","pip","install","-U","pylivemaker"],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=900)
+                    if cp.returncode!=0: raise RuntimeError((cp.stderr or cp.stdout)[-1800:])
+                    importlib.invalidate_caches()
+                    self.win.after(0,lambda:(self.check_livemaker(silent=True),messagebox.showinfo("完成","pylivemaker 安装完成。",parent=self.win)))
+                except Exception as e:
+                    self.win.after(0,lambda e=e:messagebox.showerror("安装失败",str(e),parent=self.win))
             threading.Thread(target=worker,daemon=True).start()
 
     def pick_assetripper(self):
@@ -2056,7 +2898,7 @@ class UniversalDialog:
                     messagebox.showinfo("自动识别完成","最可能引擎：%s\n\n%s" % (results[0]['engine'],"\n".join(f"{i}. {r['engine']} ({r['score']:.1f})" for i,r in enumerate(results[:5],1))),parent=self.win)
                 self.win.after(0,done)
             except Exception as e:
-                self.win.after(0,lambda:self.detect_status.set("失败")); self.win.after(0,lambda:messagebox.showerror("识别失败",str(e),parent=self.win))
+                self.win.after(0,lambda:self.detect_status.set("失败")); self.win.after(0,lambda e=e:messagebox.showerror("识别失败",str(e),parent=self.win))
         threading.Thread(target=worker,daemon=True).start()
     def pick_game(self):
         d=filedialog.askdirectory(parent=self.win)
@@ -2073,15 +2915,18 @@ class UniversalDialog:
         self.rule.delete("1.0",tk.END)
         if eng == "Unity":
             self.rule.insert(tk.END,"# Unity 后端：自动=UnityPy优先→AssetRipper兜底→传统扫描\n# UnityPy 负责 SerializedFile/AssetBundle 对象级提取与可写回\n# AssetRipper 负责复杂版本/Bundle 的项目导出兜底分析\n# 传统扫描仅作最后兜底，不承担 Unity 二进制安全写回。")
+        elif eng == "LiveMaker":
+            self.rule.insert(tk.END,"# LiveMaker / LiveNovel（.lsb 编译脚本）后端，依赖 pylivemaker。\n# 提取：lmlsb extractcsv 逐个 .lsb 导出文本；散装 .lsb 直接处理，打包在 exe/dat 里则先 lmar 解包。\n# 写回：lmlsb insertcsv 按 ID 原地改 .lsb。\n#   · 有散装 .lsb → 输出目录得到整套可直接运行的汉化包。\n#   · 文本打包在 exe/dat → 输出散装 .lsb 补丁，覆盖回游戏目录即可（LiveMaker 优先加载散装 .lsb，无需重打包 exe）。\n# 若未安装：点上方「安装 pylivemaker」。此后端不使用下方 SExtractor 规则。")
         elif eng:
             self.rule.insert(tk.END,self.bridge.meta(eng).get("sample",""))
     def refresh(self):
         self.bridge.reload()
-        vals=["选择引擎", "Unity（深度提取）"]+[x[0] for x in self.bridge.list_engines()]
+        vals=["选择引擎", "Unity（深度提取）", "LiveMaker（LSB脚本）"]+[x[0] for x in self.bridge.list_engines()]
         self.ec["values"]=vals; self.engine.set(vals[0]); self.load_rule(); self.msg("已刷新 %d 个引擎" % (len(vals)-1))
     def selected(self):
         if self.engine.get()=="选择引擎": return ""
         if self.engine.get()=="Unity（深度提取）": return "Unity"
+        if self.engine.get()=="LiveMaker（LSB脚本）": return "LiveMaker"
         return self.engine.get()
     def show_engines(self):
         lines=[f"SExtractor 原生引擎：{len(self.bridge.list_engines())} 个",""]
@@ -2103,6 +2948,14 @@ class UniversalDialog:
                     self.win.after(0,lambda:self.pb.configure(maximum=max(total,1),value=i))
                     self.win.after(0,lambda:self.msg(f"[{i}/{total}] {rel} -> {n}"))
                 sample=self.rule.get("1.0",tk.END).strip()
+                # 规则自检：SExtractor 会在每行文本开头追加 <code401>/<name> 这类控制段头部，
+                # 因此 _skip/_search 规则必须带 < 才能命中。缺少 < 的规则会静默失效，
+                # 导致脚本代码、注释等噪声全部被当成正文抽出。
+                if sample and ("_skip" in sample or "_search" in sample) and "<" not in sample:
+                    self.win.after(0, lambda: self.msg(
+                        "⚠ 规则缺少 < 控制段标记：SExtractor 会给每行文本加 <code401> 之类的头部，"
+                        "规则必须写成 ^<code401> 而非 ^code401。当前规则可能完全不生效，"
+                        "建议点『刷新』重新载入引擎默认规则。"))
                 self.bridge.unity_backend_mode=self.unity_backend.get()
                 data,stat=self.bridge.extract(game,eng,sample_override=sample or None,encode_read=self.er.get(),progress=prog,filter_enabled=self.filter_enabled.get(),filter_mode=self.filter_mode.get())
                 out=os.path.join(game,"ManualTransFile.json"); _save_translations(out,data)
@@ -2112,7 +2965,9 @@ class UniversalDialog:
                 for e in stat["errors"][:20]: self.win.after(0,lambda e=e:self.msg("⚠ "+e))
                 self.win.after(0,lambda:messagebox.showinfo("提取完成",f"{stat['items']} 条有效文本\n过滤：{stat.get('filtered',0)} 条\n输出：{out}",parent=self.win))
             except Exception as e:
-                traceback.print_exc(); self.win.after(0,lambda:messagebox.showerror("提取失败",str(e),parent=self.win))
+                error_msg = str(e)
+                traceback.print_exc()
+                self.win.after(0, lambda error_msg=error_msg: messagebox.showerror("提取失败", error_msg, parent=self.win))
         threading.Thread(target=worker,daemon=True).start()
     def inject(self):
         game=self.game.get().strip(); eng=self.selected(); fp=self.trans.get().strip() or os.path.join(game,"ManualTransFile.json")
@@ -2140,9 +2995,17 @@ class UniversalDialog:
                     self.msg(f"DLL 对话回填：{stat.get('dll_replaced',0)} 条；译文超长跳过 {stat.get('dll_skipped',0)} 条")
                     for s in stat.get("dll_skipped_samples", [])[:10]:
                         self.win.after(0,lambda s=s:self.msg("⚠ 译文超长未回填（可缩短译文后重试）: "+s))
-                self.win.after(0,lambda:messagebox.showinfo("写回完成",f"写回 {stat['replaced']} 处（含 DLL 对话 {stat.get('dll_replaced',0)} 条）\n输出：{out}\n失败文件：{len(stat['errors'])}",parent=self.win))
+                if stat.get("blob_replaced") or stat.get("blob_skipped"):
+                    self.msg(f"无定位资源串原位覆写：{stat.get('blob_replaced',0)} 处；译文过长/标识符跳过 {stat.get('blob_skipped',0)} 处")
+                    for s in stat.get("blob_skipped_samples", [])[:10]:
+                        self.win.after(0,lambda s=s:self.msg("⚠ 资源串译文过长未覆写（可缩短译文后重试）: "+s))
+                warns=stat.get("warnings",[])
+                for w in warns:
+                    self.win.after(0,lambda w=w:self.msg("⚠ "+w))
+                tail=("\n\n⚠ "+"\n⚠ ".join(warns)) if warns else ""
+                self.win.after(0,lambda tail=tail:messagebox.showinfo("写回完成",f"写回 {stat['replaced']} 处\n（DLL 对话 {stat.get('dll_replaced',0)} 条；无定位资源串原位覆写 {stat.get('blob_replaced',0)} 处）\n输出：{out}\n失败文件：{len(stat['errors'])}"+tail,parent=self.win))
             except Exception as e:
-                traceback.print_exc(); self.win.after(0,lambda:messagebox.showerror("写回失败",str(e),parent=self.win))
+                traceback.print_exc(); self.win.after(0,lambda e=e:messagebox.showerror("写回失败",str(e),parent=self.win))
         threading.Thread(target=worker,daemon=True).start()
 
 def _open():
@@ -2151,15 +3014,26 @@ def _open():
         if _DIALOG and _DIALOG.win.winfo_exists():
             _DIALOG.win.lift(); return
     except Exception: pass
-    _DIALOG=UniversalDialog(_APP,_BRIDGE)
+    _DIALOG=UniversalDialog(_APP,_get_bridge())
+
+def _get_bridge():
+    """懒构造 SExtractorHeadless：其内部 UnityBackendManager→UnityPyBackend 会 import UnityPy
+    （约 600ms），只有首次打开本工具时才需要，避免拖慢主程序启动。"""
+    global _BRIDGE
+    if _BRIDGE is None:
+        _BRIDGE = SExtractorHeadless()
+        try:
+            if _APP is not None:
+                _APP._sextractor_bridge = _BRIDGE
+        except Exception:
+            pass
+    return _BRIDGE
 
 def init_plugin(app):
-    global _APP,_BRIDGE
-    _APP=app; _BRIDGE=SExtractorHeadless()
+    global _APP
+    _APP=app
     try:
         app.tools_menu.add_separator()
         app.tools_menu.add_command(label=PLUGIN_NAME,command=_open)
     except Exception:
         pass
-    try: app._sextractor_bridge=_BRIDGE
-    except Exception: pass

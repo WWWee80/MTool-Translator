@@ -28,20 +28,59 @@ class TextExtractorCore:
 
     @staticmethod
     def detect_engine(game_dir):
-        """检测游戏引擎（Unity / RPG Maker MV/MZ / Ren'Py）"""
+        """检测游戏引擎。
+
+        重点：Unity 优先使用强特征，不能被一个普通 package.json 误判成 RPG Maker。
+        同时保留手动引擎选择作为最终兜底。
+        """
         if not os.path.isdir(game_dir):
             return None, None
 
-        # RPG Maker MV/MZ：www/data 与 package.json
-        if (os.path.isdir(os.path.join(game_dir, "www", "data")) or
-                os.path.isfile(os.path.join(game_dir, "package.json")) or
-                glob.glob(os.path.join(game_dir, "www", "data", "Map*.json"))):
+        # ---------- Unity：强特征优先 ----------
+        # Unity 游戏经常同时存在 package.json（尤其解包/导出的工程或附带文件），
+        # 旧逻辑把 package.json 当成 RPG Maker 的充分条件，会直接误判。
+        root_names = set()
+        try:
+            root_names = {n.lower() for n in os.listdir(game_dir)}
+        except OSError:
+            pass
+
+        unity_data = glob.glob(os.path.join(game_dir, "*_Data"))
+        unity_strong = (
+            bool(unity_data) or
+            "unityplayer.dll" in root_names or
+            "gameassembly.dll" in root_names or
+            any(n.startswith("unitycrashhandler") for n in root_names) or
+            os.path.isdir(os.path.join(game_dir, "MonoBleedingEdge")) or
+            os.path.isdir(os.path.join(game_dir, "il2cpp_data")) or
+            os.path.isfile(os.path.join(game_dir, "globalgamemanagers")) or
+            bool(glob.glob(os.path.join(game_dir, "*_Data", "globalgamemanagers")))
+        )
+        if unity_strong:
+            return "Unity", "unity"
+
+        # 只有 .assets/.bundle/.unity3d 等资产时，也倾向 Unity；
+        # 不再用递归扫描所有文件夹作为 RPG Maker 的判断依据。
+        unity_assets = glob.glob(os.path.join(game_dir, "**", "*.assets"), recursive=True)[:3]
+        unity_bundles = glob.glob(os.path.join(game_dir, "**", "*.unity3d"), recursive=True)[:3]
+        if unity_assets or unity_bundles:
+            return "Unity", "unity"
+
+        # ---------- RPG Maker MV/MZ：要求 www/data 结构 ----------
+        # package.json 单独存在不够，因为 Unity/其他网页组件也可能带 package.json。
+        rpg_data = os.path.join(game_dir, "www", "data")
+        if (os.path.isdir(rpg_data) or
+                bool(glob.glob(os.path.join(rpg_data, "Map*.json")))):
             return "RPG Maker MV/MZ", "rpgmaker"
 
-        # Unity：*_Data 目录或 .assets 文件
-        if (glob.glob(os.path.join(game_dir, "*_Data")) or
-                glob.glob(os.path.join(game_dir, "**", "*.assets"), recursive=True)[:3]):
-            return "Unity", "unity"
+        # 某些 MV/MZ 打包目录会把 data 放在 www 下，但目录检查不足时再看 package.json
+        # 只有 package.json + data/Map*.json 这类组合才认为是 RPG Maker。
+        www_dir = os.path.join(game_dir, "www")
+        if (os.path.isfile(os.path.join(game_dir, "package.json")) and
+                os.path.isdir(www_dir) and
+                (os.path.isfile(os.path.join(www_dir, "data", "System.json")) or
+                 bool(glob.glob(os.path.join(www_dir, "data", "Map*.json"))))):
+            return "RPG Maker MV/MZ", "rpgmaker"
 
         return None, None
 
@@ -324,16 +363,48 @@ class TextExtractorCore:
         else:
             data_dirs.append(game_dir)
 
-        files = []
+        # 事件类文件：按事件指令码抽（脚本 code355/655、注释 code108/408 天然不在
+        # SHOW/CHOICES/NAME 集合里，因此不会抽出 JS 代码与注释）
+        event_files = []
+        # 数据库文件：没有事件指令结构，必须按字段抽（角色名/技能名/物品名/敌人名…
+        # 这些玩家天天可见，漏掉会导致 UI 上仍是日文）
+        db_files = []
+        # Animations.json 的 name 是作者给特效起的名字，恰好常与技能名同名，
+        # 可作为技能名翻译的对照；其中的音效/SE 资源名(Slash6/Damage8 等)是纯 ASCII，
+        # 会被 is_valid_text 与噪声规则滤掉，不会污染结果。
+        DB_NAMES = ("Actors.json", "Classes.json", "Skills.json", "Items.json",
+                    "Weapons.json", "Armors.json", "Enemies.json", "States.json",
+                    "MapInfos.json", "System.json", "Tilesets.json", "Animations.json")
         for d in data_dirs:
             if not os.path.isdir(d):
                 continue
-            files.extend(glob.glob(os.path.join(d, "Map*.json")))
+            event_files.extend(sorted(glob.glob(os.path.join(d, "Map*.json"))))
             for name in ("CommonEvents.json", "Troops.json"):
                 p = os.path.join(d, name)
                 if os.path.isfile(p):
-                    files.append(p)
+                    event_files.append(p)
+            for name in DB_NAMES:
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    db_files.append(p)
 
+        # 数据库字段白名单：只取面向玩家的文本，不碰 iconIndex/animationId 等数值与资源名
+        DB_FIELDS = ("name", "description", "nickname", "profile",
+                     "message1", "message2", "message3", "message4")
+
+        def walk_db(node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k in DB_FIELDS and isinstance(v, str):
+                        cls._add(result, v, min_len)
+                    else:
+                        walk_db(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk_db(v)
+
+        files = event_files + db_files
+        db_set = set(db_files)
         total = len(files)
         for i, fp in enumerate(files):
             cls._report_file(progress_queue, fp)
@@ -341,7 +412,10 @@ class TextExtractorCore:
             try:
                 with open(fp, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
-                walk(data)
+                if fp in db_set:
+                    walk_db(data)
+                else:
+                    walk(data)
             except Exception:
                 continue
 
@@ -554,6 +628,11 @@ class ExtractorDialog:
         self._worker_thread = None
         self._stop_event = threading.Event()
         self._progress_queue = queue.Queue()
+        # 必须早于 _setup_dnd()/_log()：这些会在控件创建前被调用
+        self._closed = False
+        self._poll_id = None
+        self.log_text = None
+        self._pending_logs = []
 
         self.win = tk.Toplevel(parent)
         self.win.title("从游戏提取文本")
@@ -686,18 +765,37 @@ class ExtractorDialog:
                   foreground="#0066cc", font=("微软雅黑", 8)).pack(pady=(0, 8))
 
         # 启动进度轮询
+        self.win.protocol("WM_DELETE_WINDOW", self.destroy)
         self._poll_progress()
+
+    def _alive(self):
+        """窗口与日志控件是否仍存在（模态弹窗期间窗口可能已被销毁）"""
+        if self._closed:
+            return False
+        try:
+            return bool(self.win.winfo_exists())
+        except Exception:
+            return False
 
     def _poll_progress(self):
         """轮询进度队列，更新UI"""
+        self._poll_id = None
+        if not self._alive():
+            return
         try:
             while True:
                 msg = self._progress_queue.get_nowait()
                 self._handle_progress_msg(msg)
+                # 处理 done/error 时会弹模态框并可能销毁窗口，需立即停止
+                if not self._alive():
+                    return
         except queue.Empty:
             pass
         # 每100ms轮询一次
-        self.win.after(100, self._poll_progress)
+        try:
+            self._poll_id = self.win.after(100, self._poll_progress)
+        except Exception:
+            self._poll_id = None
 
     def _handle_progress_msg(self, msg):
         """处理进度消息"""
@@ -795,11 +893,28 @@ class ExtractorDialog:
                 self.out_var.set(f"{dir_name}_ManualTransFile.json")
 
     def _log(self, msg):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"{msg}\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
-        self.win.update_idletasks()
+        # _setup_dnd() 在 log_text 创建前就会调用本方法；窗口销毁后也可能被回调触发
+        if getattr(self, 'log_text', None) is None or not self._alive():
+            self._pending_logs = getattr(self, '_pending_logs', [])
+            self._pending_logs.append(msg)
+            return
+        try:
+            # 补发早于控件创建的日志
+            pending = getattr(self, '_pending_logs', None)
+            if pending:
+                self._pending_logs = []
+                for m in pending:
+                    self.log_text.config(state=tk.NORMAL)
+                    self.log_text.insert(tk.END, f"{m}\n")
+                    self.log_text.config(state=tk.DISABLED)
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.insert(tk.END, f"{msg}\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
+            self.win.update_idletasks()
+        except tk.TclError:
+            # 控件已随窗口销毁，静默丢弃
+            pass
 
     def _browse_dir(self):
         d = filedialog.askdirectory(title="选择游戏根目录")
@@ -1009,13 +1124,15 @@ class ExtractorDialog:
         self._reset_ui()
 
         messagebox.showinfo("完成", f"成功提取 {count} 条文本！\n\n已保存: {out_path}\n\n输入文件已自动填入，可直接开始翻译。", parent=self.win)
-        self.win.destroy()
+        # 走 destroy() 而非 win.destroy()：需同时取消挂起的进度轮询回调
+        self.destroy()
 
     def _on_extraction_error(self, msg):
         """提取错误处理"""
         self._log(f"\n❌ 错误: {msg}")
         self._reset_ui()
-        messagebox.showerror("错误", f"提取失败:\n{msg}", parent=self.win)
+        if self._alive():
+            messagebox.showerror("错误", f"提取失败:\n{msg}", parent=self.win)
 
     def _cancel(self):
         """取消/停止提取"""
@@ -1031,14 +1148,32 @@ class ExtractorDialog:
 
     def _reset_ui(self):
         """恢复UI状态"""
-        self.start_btn.config(state=tk.NORMAL)
-        self.cancel_btn.config(text="❌ 取消", command=self._cancel)
         self._worker_thread = None
+        if not self._alive():
+            return
+        try:
+            self.start_btn.config(state=tk.NORMAL)
+            self.cancel_btn.config(text="❌ 取消", command=self._cancel)
+        except tk.TclError:
+            pass
 
     def destroy(self):
         """销毁窗口时确保线程停止"""
+        if self._closed:
+            return
         self._cancel()
-        self.win.destroy()
+        self._closed = True
+        # 取消挂起的轮询回调，否则窗口销毁后回调仍会触发 TclError
+        if self._poll_id is not None:
+            try:
+                self.win.after_cancel(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
 
 # ==================== 主程序集成钩子 ====================

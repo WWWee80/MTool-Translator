@@ -13,10 +13,12 @@ import json
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import urllib3
 import ssl
 import time
 import os
+import hashlib
 import sys
 import datetime
 import threading
@@ -44,7 +46,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def pool_request(method, url, body=None, headers=None, timeout=60):
     """通过全局连接池发HTTP请求，返回解析后的JSON。连接自动复用。"""
-    resp = HTTP_POOL.request(method, url, body=body, headers=headers or {}, timeout=timeout)
+    h = dict(headers or {})
+    # 浏览器UA：Cloudflare按UA拦截Python默认UA（403 error 1010）
+    h.setdefault('User-Agent',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36')
+    resp = HTTP_POOL.request(method, url, body=body, headers=h, timeout=timeout)
     return json.loads(resp.data.decode('utf-8'))
 
 
@@ -152,6 +158,10 @@ class TranslatorBase:
         # 默认开启gzip压缩（urllib3自动解压），连接超时5秒快速失败，读取超时用self.timeout
         req_headers = dict(headers or {})
         req_headers.setdefault('Accept-Encoding', 'gzip, deflate')
+        # 浏览器样式UA：Groq等服务前的Cloudflare会按UA拦截（Python默认UA → 403 error 1010），
+        # 换成浏览器UA即可正常通过，与Key无关
+        req_headers.setdefault('User-Agent',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36')
         timeout = urllib3.Timeout(connect=5.0, read=self.timeout)
         # 429自适应退避：被限流时等1.5s/3s后自动重试（共3次尝试），其余错误照旧直接抛出。
         # 只在被限流时才触发，不影响正常速度；避免高并发下一条429就把条目直接判失败。
@@ -187,7 +197,9 @@ class TranslatorBase:
             status_hint = {
                 401: "API Key无效或已过期",
                 402: "账户余额不足或欠费，请充值",
-                403: "无权限访问该模型或API",
+                403: "无权限访问（403）：可能是①该模型无权限②账户未充值/未开通，"
+                     "③IP被服务方区域拦截（Groq/OpenAI/Anthropic等对部分地区IP直接返回403，"
+                     "与Key无关——请配置代理/CF Worker代理，或换国内可直连的引擎如硅基流动/DeepSeek/智谱）",
                 404: "Base URL或模型名称错误",
                 429: "请求过于频繁，已被限流，请降低并发数",
                 500: "服务器内部错误，请稍后重试",
@@ -904,9 +916,217 @@ def _norm_base(u):
     return s
 
 
+def _glossary_chat_url(base):
+    """由 OpenAI 兼容 Base URL 拼出术语AI的 /chat/completions 地址。
+    云端 base 已带 /v1（或 /v2..v4）直接追加；本地 Ollama(11434)/LM Studio 若填了裸主机
+    （http://localhost:11434 无路径）则自动补 /v1 再追加——术语接口不是 Ollama 原生 /api/chat。"""
+    b = _norm_base(base) if base else ""
+    if not b:
+        return ""
+    low = b.lower()
+    if '/v1' in low or b.rstrip('/').endswith(('/v2', '/v3', '/v4', '/openai/v1')):
+        return b + '/chat/completions'
+    if ('localhost' in low or low.startswith(('http://127.0.0.1', 'https://127.0.0.1'))
+            or ':11434' in low or ':1234' in low):
+        return b + '/v1/chat/completions'
+    return b + '/chat/completions'
+
+
+AGNES_CHAT_BASE = "https://api.agnes-ai.cn/v1"
+AGNES_CHAT_MODEL = "agnes-2.5-flash"
+# Agnes 不提供 GET /models 列表接口（OpenAI兼容仅 /v1/chat/completions），模型为固定目录。
+AGNES_KNOWN_MODELS = ["agnes-2.5-flash", "agnes-2.0-flash", "agnes-1.5-flash"]
+
+
+def _glossary_models_urls(base):
+    """按优先级列出候选的「模型列表」端点。先取与 chat 同一版本前缀的 /models，
+    再退到裸 /models、/v1/models，本地再补 Ollama 原生 /api/tags —— 各家路径约定不一，依次试。"""
+    urls = []
+    chat = _glossary_chat_url(base) if base else ""
+    if chat.endswith("/chat/completions"):
+        urls.append(chat[: -len("/chat/completions")] + "/models")
+    norm = _norm_base(base)
+    if norm:
+        urls.append(norm + "/models")
+        if not norm.rstrip('/').lower().endswith('/v1'):
+            urls.append(norm + "/v1/models")
+        low = norm.lower()
+        if ('localhost' in low or low.startswith(('http://127.0.0.1', 'https://127.0.0.1'))
+                or ':11434' in low or ':1234' in low):
+            urls.append(norm + "/api/tags")
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _glossary_parse_models(data):
+    """兼容 /models、/api/tags、裸数组 三种返回格式 → 模型名列表。"""
+    models = []
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            models = [m.get("id") for m in data["data"] if isinstance(m, dict) and (m.get("id") or m.get("name"))]
+        elif isinstance(data.get("models"), list):
+            models = [m.get("id") or m.get("name") for m in data["models"] if isinstance(m, dict)]
+    elif isinstance(data, list):
+        models = [m.get("id") or m.get("name") for m in data if isinstance(m, dict) and (m.get("id") or m.get("name"))]
+    return sorted({str(x) for x in models if x})
+
+
+def _glossary_parse_ai_array(content):
+    """把术语AI返回的文本稳健地解析成 JSON 数组。
+    容忍：```json 代码围栏、前后多余文字、整段是 {"terms":[...]} 或 {"data":[...]} 包装、
+    以及多行缩进。失败返回 None（绝不静默吞成 []）。"""
+    if not content or not isinstance(content, str):
+        return None
+    s = content.strip()
+    s = re.sub(r"^```[A-Za-z]*\s*", "", s)
+    s = re.sub(r"\s*```\s*$", "", s).strip()
+    # 直接整段尝试
+    try:
+        o = json.loads(s)
+        if isinstance(o, list):
+            return o
+        if isinstance(o, dict):
+            for val in o.values():
+                if isinstance(val, list):
+                    return val
+            # 对象但里面没有数组 → 无效
+            return None
+    except Exception:
+        pass
+    # 括号深度扫描取第一个顶层 [...]（兼容数组前/后还有说明文字）
+    start = s.find("[")
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        o = json.loads(s[start:i + 1])
+                        return o if isinstance(o, list) else None
+                    except Exception:
+                        return None
+    return None
+
+
+# 术语分类允许的规范类别 + 常见近义词归并（模型措辞不统一时不再整条丢弃）
+_GLOSSARY_ALLOWED_CATS = {"人名", "地名", "阵营", "角色", "职业", "技能", "装备", "道具", "怪物", "特殊组织", "其他"}
+_GLOSSARY_CAT_MAP = {
+    "人物": "角色", "主角": "角色", "NPC": "角色", "npc": "角色", "队友": "角色", "同伴": "角色",
+    "配角": "角色", "角色名": "角色", "敌方角色": "角色", "女主角": "角色", "男主角": "角色",
+    "地点": "地名", "区域": "地名", "場所": "地名", "区域名": "地名", "国家": "地名", "王国": "地名",
+    "城镇": "地名", "城市": "地名", "村庄": "地名", "迷宫": "地名", "大陆": "地名", "森林": "地名",
+    "武器": "装备", "防具": "装备", "护甲": "装备", "护具": "装备", "首饰": "装备", "饰品": "装备",
+    "装备品": "装备", "武器名": "装备", "盾": "装备", "铠甲": "装备",
+    "组织": "特殊组织", "教团": "特殊组织", "骑士团": "特殊组织", "公会": "特殊组织", "旅团": "特殊组织",
+    "军团": "特殊组织", "结社": "特殊组织", "教会": "特殊组织",
+    "势力": "阵营", "派系": "阵营", "国家阵营": "阵营",
+    "魔法": "技能", "咒文": "技能", "法术": "技能", "招式": "技能", "奥义": "技能", "必杀技": "技能",
+    "必杀": "技能", "特技": "技能", "武技": "技能", "术式": "技能", "技能名": "技能",
+    "消耗品": "道具", "药品": "道具", "回复药": "道具", "道具名": "道具", "材料": "道具", "素材": "道具",
+    "物品": "道具", "资源": "道具", "宝物": "道具", "食材": "道具",
+    "头目": "怪物", "Boss": "怪物", "boss": "怪物", "BOSS": "怪物", "魔物": "怪物", "妖怪": "怪物",
+    "敌人": "怪物", "敌方": "怪物", "怪兽": "怪物", "怪物名": "怪物", "魔兽": "怪物",
+    "称号": "其他", "徽章": "其他", "成就": "其他", "任务": "其他", "章节名": "其他", "标题": "其他",
+}
+
+
+def _glossary_to_conf(c):
+    """把模型给的 confidence 稳健转成 0~1 浮点（兼容数字/字符串/百分比）。"""
+    try:
+        f = float(c)
+    except Exception:
+        try:
+            f = float(str(c).strip().rstrip("%")) / 100.0
+        except Exception:
+            return 0.0
+    return min(1.0, max(0.0, f))
+
+
+def build_no_think_fields(model, base_url):
+    """按厂商生成「关闭思考模式/思维链」的请求体参数（模块级，供主翻译与精修共用）。
+
+    翻译是直译任务，不需要 CoT。开思考会：①多耗大量 output token（常翻倍以上）
+    ②显著拖慢响应 ③思考内容可能混进译文污染输出。
+
+    各家参数不统一，按「模型名优先、Base URL 兜底」精准匹配；
+    匹配不到厂商时返回空 dict（不传额外参数），避免未知服务端因不认识的参数报错。
+
+    各家官方参数（2026-09 核对）：
+      智谱 GLM-4.5+      thinking={"type":"disabled"}   GLM-5/4.7 默认强制思考
+      千问 Qwen3+        enable_thinking=false          qwen3.5+ 默认开启思考
+      Kimi K2            enable_thinking=false
+      MiniMax            thinking={"type":"disabled"}
+      DeepSeek V4        thinking={"type":"disabled"}   V4 默认思考开启，需主动关闭
+      vLLM/SGLang 自建    chat_template_kwargs={"enable_thinking":false}
+    """
+    model = (model or '').lower()
+    base = (_norm_base(base_url) or '').lower()
+
+    # DeepSeek 官方 reasoner 系列是「强制思考」模型，参数关不掉，只能换模型名。
+    # 直接返回空，避免传了参数也无效还平添风险。
+    if ('deepseek' in model or 'deepseek' in base) and (
+            'reasoner' in model or model.endswith('-r1') or '-r1-' in model):
+        return {}
+
+    fields = {}
+    # 智谱 GLM-4.5 及以上（含 GLM-5/4.6/4.7）
+    is_glm = ('glm-' in model or model.startswith('glm') or
+              'bigmodel.cn' in base or 'z.ai' in base)
+    if is_glm:
+        fields['thinking'] = {'type': 'disabled'}
+
+    # 千问 Qwen3 及以上（阿里云百炼/魔搭/硅基流动等）
+    is_qwen = ('qwen' in model or 'dashscope' in base or 'bailian' in base or
+               'modelscope' in base)
+    if is_qwen:
+        fields['enable_thinking'] = False
+
+    # Kimi（月之暗面 K2 系列）
+    if 'kimi' in model or 'moonshot' in base:
+        fields['enable_thinking'] = False
+
+    # MiniMax / 稀宇
+    if 'minimax' in model or 'minimaxi' in base:
+        fields['thinking'] = {'type': 'disabled'}
+
+    # DeepSeek V4 默认思考开启（effort=high），无论官方域名还是中转站
+    # 都要传 thinking.type=disabled 主动关闭；官方 API 支持该参数。
+    if ('deepseek' in model or 'deepseek' in base) and 'thinking' not in fields:
+        fields['thinking'] = {'type': 'disabled'}
+
+    # vLLM / SGLang 自建部署（Qwen3 等）：chat_template_kwargs 硬开关
+    if is_qwen and ('localhost' in base or '127.0.0.1' in base or ':8000' in base):
+        fields['chat_template_kwargs'] = {'enable_thinking': False}
+
+    return fields
+
+
 
 # DeepSeek Prompt Cache 优化：固定前缀尽可能长期不变；语言方向和当前文本放到后部。
 CACHE_PREFIX_MARK = "MTool-CachePrefix-v2"
+
+# DeepSeek 上下文硬盘缓存以 64 tokens 为一个存储单元：只有从 token 0 起凑满 64 的
+# 整块才会入缓存，不足 64 的尾巴每次都按 miss 价重发。「system + 固定指令」这段公共
+# 前缀恰好卡在非整数倍上，尾巴常年白付 miss 价，所以要把它顶到 64 的整数倍。
+CACHE_BLOCK_TOKENS = 64
+CACHE_ALIGN_MARK = "\n\n【忽略·缓存对齐】"
+# 填充必须用互不相同的字符轮转：同一个字符重复会被 BPE 合并成一个 token，
+# 长度就卡住永远凑不到整数倍。
+CACHE_ALIGN_POOL = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥金木水火土"
+
+# 固定指令单独成一条 user 消息，排在动态术语块之前（术语块每批都变，
+# 夹在中间会把指令挤出可缓存区）。
+BATCH_LEADIN = ("请逐条翻译以下文本，严格按编号输出，每条一行，格式为：编号. 译文。"
+                "不要解释，不要添加额外内容。")
+SINGLE_LEADIN = "请翻译以下文本，只输出译文，不要解释，不要添加额外内容。"
 
 
 class OpenAICompatTranslator(TranslatorBase):
@@ -925,11 +1145,15 @@ class OpenAICompatTranslator(TranslatorBase):
     supports_batch = True
 
     def __init__(self, *args, **kwargs):
+        # 自动关闭思考模式：翻译场景不需要CoT，思考会多耗token、拖慢速度、还可能污染译文
+        self.disable_thinking = kwargs.pop('disable_thinking', True)
         super().__init__(*args, **kwargs)
         self._cache_stats = {"hit": 0, "miss": 0, "prompt": 0, "completion": 0, "requests": 0,
                              "cache_read": 0, "cache_write": 0}
         self._cache_stats_lock = threading.Lock()
         self._cache_prefix = None
+        self._system_cache = {}
+        self._align_pads = {}
         self._cache_prefix_glossary = None
         self._cache_task_key = None
         self._cache_session_id = None
@@ -940,23 +1164,54 @@ class OpenAICompatTranslator(TranslatorBase):
                 or "deepseek" in (self.model or '').lower())
 
     def _build_static_prefix(self):
-        """构造整轮任务内不变的 system 前缀。"""
-        glossary = getattr(self, '_glossary', '') or ''
-        if self._cache_prefix is not None and glossary == self._cache_prefix_glossary:
+        """构造尽可能短且稳定的公共前缀；术语表绝不放进这里。"""
+        if self._cache_prefix is not None:
             return self._cache_prefix
-        parts = [
+        self._cache_prefix = "\n\n".join([
             CACHE_PREFIX_MARK,
             TRANSLATE_SYSTEM.strip(),
-            "【缓存规则】本次任务内以上说明保持不变；当前语言方向和待翻译文本放在后续消息中。",
-        ]
-        if glossary:
-            parts.extend([
-                "【固定术语表】",
-                glossary.strip(),
-            ])
-        self._cache_prefix = "\n\n".join(p for p in parts if p)
-        self._cache_prefix_glossary = glossary
+            "【缓存规则】以上说明在本次任务内保持不变；变化内容统一放到后续消息。",
+        ])
         return self._cache_prefix
+
+    def _relevant_glossary(self, text, max_terms=10, max_chars=1200):
+        """只抽取当前文本真正相关的术语，避免整张术语表破坏缓存并浪费输入Token。"""
+        glossary = getattr(self, '_glossary', '') or ''
+        if not glossary or not text:
+            return ''
+        rows = []
+        for raw in glossary.splitlines():
+            line = raw.strip()
+            if not line or '=' not in line:
+                continue
+            source, target = line.split('=', 1)
+            source, target = source.strip(), target.strip()
+            if source and target and source in text:
+                rows.append((source, target))
+        # 长词优先，避免“王”抢在“王国守卫”之前；结果数量和总字符数双重限额。
+        rows.sort(key=lambda x: len(x[0]), reverse=True)
+        out = []
+        used = 0
+        for source, target in rows[:max_terms]:
+            item = f"{source} = {target}"
+            if used + len(item) + 1 > max_chars:
+                continue
+            out.append(item)
+            used += len(item) + 1
+        return "\n".join(out)
+
+    @staticmethod
+    def _cache_text_key(src, tgt, text):
+        """统一本地缓存键：只规范换行和多余空白，不改动游戏原始字符。
+
+        注意历史 bug：这里曾误写为 '\\\\r\\\\n' 和 r'[ \\\\t]+'，
+        前者匹配的是字面反斜杠+r（真实 CRLF 从未被归一化），
+        后者的字符集实际是「空格/反斜杠/字母t」，会把原文里每个 t 和 \\ 替换成空格，
+        导致 test/ttest/tttest 撞同一个键、返回错误译文。必须用真实控制字符。
+        """
+        normalized = str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+        normalized = re.sub(r'[ \t]+', ' ', normalized).strip()
+        return f"{src}|{tgt}|{normalized}"
 
     def set_cache_identity(self, task_key):
         """设置本轮翻译固定缓存身份；同一任务的所有请求共用。"""
@@ -979,6 +1234,12 @@ class OpenAICompatTranslator(TranslatorBase):
         if self._is_tokenhub() and self._cache_task_key:
             fields["prompt_cache_key"] = self._cache_task_key
         return fields
+
+    def _no_think_fields(self):
+        """返回关闭「思考模式/思维链」的请求体参数（委托给模块级函数）。"""
+        if not getattr(self, 'disable_thinking', True):
+            return {}
+        return build_no_think_fields(self.model, self.base_url)
 
     def _is_tokenhub(self):
         return "tokenhub.tencentmaas.com" in (_norm_base(self.base_url) or '').lower()
@@ -1024,52 +1285,149 @@ class OpenAICompatTranslator(TranslatorBase):
         with self._cache_stats_lock:
             return dict(self._cache_stats)
 
-    def warmup_cache(self, source_lang, target_lang):
-        """自动预热Prompt Cache：只发送一次极短测试请求，不计入正式缓存统计。"""
-        if not self._is_deepseek():
-            return False, "当前引擎不是DeepSeek，跳过Prompt Cache预热"
+    def _system_content(self, source_lang, target_lang):
+        """system = 固定前缀 + 语言方向；同一任务内必须逐字节稳定，否则前缀立刻分叉。"""
+        key = (source_lang, target_lang)
+        cached = self._system_cache.get(key)
+        if cached is not None:
+            return cached
         src_name = LANG_NAMES.get(source_lang, source_lang)
         tgt_name = LANG_NAMES.get(target_lang, target_lang)
-        system_content = self._build_static_prefix() + (
+        content = self._build_static_prefix() + (
             f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
         )
-        data = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": "请仅输出：OK"},
-            ],
-            "temperature": 0,
-            "max_tokens": 1,
-        }
+        self._system_cache[key] = content
+        return content
+
+    def _leadin(self, kind, source_lang, target_lang):
+        """固定指令消息（含 64 对齐填充）。填充由 warmup_cache 现场标定，标定失败则为空。"""
+        base = BATCH_LEADIN if kind == "batch" else SINGLE_LEADIN
+        return base + self._align_pads.get((kind, source_lang, target_lang), "")
+
+    def _probe_prompt_tokens(self, messages):
+        """发一次 max_tokens=1 的探针，取服务端自己算的 prompt_tokens；不计入缓存统计。"""
+        data = {"model": self.model, "messages": messages, "temperature": 0, "max_tokens": 1}
         data.update(self._cache_body_fields())
+        data.update(self._no_think_fields())
         url = f"{_norm_base(self.base_url)}/chat/completions"
+        result = self._http_post(url, data, self._cache_headers())
+        return int((result.get('usage') or {}).get('prompt_tokens') or 0)
+
+    def _calibrate_alignment(self, source_lang, target_lang):
+        """用 API 返回的 prompt_tokens 现场标定填充长度，让公共前缀落在 64 的整数倍上。
+
+        不依赖本地 tokenizer（打包 EXE 时不想背一个 8MB 的 tokenizer.json），
+        改了 TRANSLATE_SYSTEM、换了语言方向也会自动重算：
+          探针1 量出 chat template 尾部（<|Assistant|> 之类）占几个 token；
+          探针2 量出「system + 固定指令」的真实长度，算出差多少才够整块；
+          探针3 量出对齐标记本身多重，补完再验一次——中文偶尔会被 BPE 合并掉，
+                合并了就按实测差值再修，修 3 次还不对就放弃填充（退回不对齐，不会更差）。
+        """
+        tail = self._probe_prompt_tokens([{"role": "user", "content": "一"}]) - 3
+        if not 0 <= tail <= 8:
+            raise ValueError(f"chat template 尾部长度异常({tail})")
+        system_content = self._system_content(source_lang, target_lang)
+
+        def head_len(leadin):
+            n = self._probe_prompt_tokens([
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": leadin},
+            ]) - tail
+            if n <= 0:
+                raise ValueError("探针未返回 prompt_tokens")
+            return n
+
+        aligned = 0
+        for kind in ("batch", "single"):
+            base = BATCH_LEADIN if kind == "batch" else SINGLE_LEADIN
+            bare = head_len(base)
+            mark_cost = head_len(base + CACHE_ALIGN_MARK) - bare
+            need = -bare % CACHE_BLOCK_TOKENS
+            while need and need < mark_cost:      # 连标记都塞不下就顶到下一个整块
+                need += CACHE_BLOCK_TOKENS
+            pad, ok = "", need == 0
+            for _ in range(3):
+                if ok:
+                    break
+                cand = CACHE_ALIGN_MARK + "".join(
+                    # 步长 13 打散：顺着取会排出「甲乙」「子丑」这种常见二字词，
+                    # 它们在词表里是单个 token，一合并填充长度就不对，白白多几轮探针。
+                    CACHE_ALIGN_POOL[(i * 13) % len(CACHE_ALIGN_POOL)]
+                    for i in range(need - mark_cost))
+                got = head_len(base + cand)
+                if got % CACHE_BLOCK_TOKENS == 0:
+                    pad, ok = cand, True
+                    break
+                need += -got % CACHE_BLOCK_TOKENS
+            self._align_pads[(kind, source_lang, target_lang)] = pad
+            aligned += bool(ok)
+        return aligned == 2
+
+    def warmup_cache(self, source_lang, target_lang):
+        """自动预热Prompt Cache：只发送一次极短测试请求，不计入正式缓存统计。
+
+        门控需覆盖 TokenHub：TokenHub 同样依赖固定前缀 + session 路由复用 KV Cache，
+        若只判 _is_deepseek()，TokenHub 上的 qwen/GLM 等模型会被直接跳过预热，
+        首批正式请求全部撞冷前缀。其余 OpenAI 兼容服务不保证前缀缓存语义，仍跳过以免白发一次请求。
+        """
+        if not (self._is_deepseek() or self._is_tokenhub()):
+            return False, "当前引擎不支持Prompt Cache预热，已跳过"
+        system_content = self._system_content(source_lang, target_lang)
+        align_note = ""
         try:
-            result = self._http_post(url, data, self._cache_headers())
-            u = result.get('usage') or {}
-            used = int(u.get('prompt_tokens') or 0)
-            return True, f"预热请求完成（约{used:,} prompt tokens），正式翻译将复用固定前缀"
+            align_note = ("，公共前缀已按 64 tokens 对齐"
+                          if self._calibrate_alignment(source_lang, target_lang)
+                          else "，前缀对齐只标定成功一半，其余按原样发送")
+        except Exception as e:
+            self._align_pads.clear()
+            align_note = f"，前缀 64 对齐标定失败已跳过（{str(e)[:60]}）"
+        # 批量/单条两条分支各自预热一次：正式请求的公共前缀到「固定指令」为止，
+        # 只热 system 的话第一批仍然会撞冷指令块。
+        url = f"{_norm_base(self.base_url)}/chat/completions"
+        used = 0
+        try:
+            for kind in ("batch", "single"):
+                data = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user",
+                         "content": self._leadin(kind, source_lang, target_lang)},
+                        {"role": "user", "content": "请仅输出：OK"},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 1,
+                }
+                data.update(self._cache_body_fields())
+                data.update(self._no_think_fields())
+                result = self._http_post(url, data, self._cache_headers())
+                used = max(used, int((result.get('usage') or {}).get('prompt_tokens') or 0))
         except Exception as e:
             return False, f"预热失败：{str(e)[:160]}"
+        return True, (f"预热请求完成（约{used:,} prompt tokens）{align_note}，"
+                      f"正式翻译将复用固定前缀")
 
     def _messages(self, text, source_lang, target_lang):
         src_name = LANG_NAMES.get(source_lang, source_lang)
         tgt_name = LANG_NAMES.get(target_lang, target_lang)
         # 同一翻译任务的语言方向也固定进 system，使“system+语言方向”形成稳定公共前缀。
         # 不同语言方向自然形成不同缓存分支，但同一任务内可以持续复用。
-        system_content = self._build_static_prefix() + (
-            f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
-        )
         messages = [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": self._system_content(source_lang, target_lang)},
+            # 固定指令必须排在术语块之前：术语块每句都变，夹在中间会把指令挤出可缓存区。
+            {"role": "user", "content": self._leadin("single", source_lang, target_lang)},
         ]
-        # DeepSeek 默认关闭滚动上下文：上下文每条都会变化，会让后续公共前缀频繁分叉。
-        # 其他 OpenAI-compatible 引擎继续保留原有上下文能力。
-        if not self._is_deepseek():
+        relevant = self._relevant_glossary(text)
+        if relevant:
+            messages.append({"role": "user", "content": "【本句相关术语】\n" + relevant})
+        # 关闭滚动上下文的判据应是「该服务是否依赖前缀缓存」，而非厂商名。
+        # 上下文每条都变，会让公共前缀在 system 之后立刻分叉；TokenHub 同样按前缀+session
+        # 复用 KV Cache，若继续注入滚动上下文，命中率会被摊薄到接近 0。
+        if not (self._is_deepseek() or self._is_tokenhub()):
             for orig, trans in self.context[-3:]:
                 messages.append({"role": "user", "content": f"将以下{src_name}文本翻译成{tgt_name}：{orig}"})
                 messages.append({"role": "assistant", "content": trans})
-        messages.append({"role": "user", "content": f"请翻译以下文本，只输出译文：\n{text}"})
+        messages.append({"role": "user", "content": text})
         return messages
 
     def translate(self, text, source_lang, target_lang):
@@ -1081,6 +1439,7 @@ class OpenAICompatTranslator(TranslatorBase):
             "max_tokens": 4096,
         }
         data.update(self._cache_body_fields())
+        data.update(self._no_think_fields())
         result = self._http_post(url, data, self._cache_headers())
         if 'choices' not in result or not result['choices']:
             err = result.get('error', {})
@@ -1090,18 +1449,19 @@ class OpenAICompatTranslator(TranslatorBase):
         return result['choices'][0]['message']['content'].strip()
 
     def translate_batch(self, texts, source_lang, target_lang):
-        src_name = LANG_NAMES.get(source_lang, source_lang)
-        tgt_name = LANG_NAMES.get(target_lang, target_lang)
         url = f"{_norm_base(self.base_url)}/chat/completions"
         numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
-        system_content = self._build_static_prefix() + (
-            f"\n\n【当前任务语言方向】源语言：{src_name}；目标语言：{tgt_name}"
-        )
         messages = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": ("请逐条翻译以下文本，严格按编号输出，每条一行，格式为：编号. 译文。"
-                                          "不要解释，不要添加额外内容。\n" + numbered)},
+            {"role": "system", "content": self._system_content(source_lang, target_lang)},
+            # 固定指令必须排在术语块之前：术语块每批都变，夹在中间会把指令挤出可缓存区。
+            {"role": "user", "content": self._leadin("batch", source_lang, target_lang)},
         ]
+        # 批量请求中把相关术语放在动态区；固定system前缀保持完全一致。
+        batch_glossary = self._relevant_glossary("\n".join(texts), max_terms=16, max_chars=1600)
+        if batch_glossary:
+            messages.append({"role": "user", "content": "【本批相关术语】\n" + batch_glossary})
+        messages.append({"role": "user", "content": numbered})
+
         data = {
             "model": self.model,
             "messages": messages,
@@ -1109,6 +1469,7 @@ class OpenAICompatTranslator(TranslatorBase):
             "max_tokens": 4096,
         }
         data.update(self._cache_body_fields())
+        data.update(self._no_think_fields())
         result = self._http_post(url, data, self._cache_headers())
         if 'choices' not in result or not result['choices']:
             err = result.get('error', {})
@@ -1292,7 +1653,7 @@ PRESETS = {
     },
     "DeepSeek": {
         "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "hint": "在 https://platform.deepseek.com 注册，新用户送500万token",
         "recommended_workers": 4,
     },
@@ -1332,6 +1693,37 @@ PRESETS = {
         "hint": "Qwen3-8B去审查版，40K上下文，成人游戏文本不拒。安装：ollama pull richardyoung/qwen3-8b-abliterated:Q4_K_M",
         "recommended_workers": 2,
     },
+    "LM Studio本地": {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "model": "",
+        "hint": "LM Studio本地OpenAI兼容API（注意端口后必须带/v1）。启动LM Studio加载模型，点'获取模型'自动列出已加载模型；推荐日→中galgame翻译: Sakura-Galtransl-7B（专用微调），通用备选: Qwen3-8B。API Key填任意非空字符串（如 lm-studio）。",
+        "recommended_workers": 4,
+    },
+}
+
+# ===== 术语AI的LLM预设（OpenAI兼容；术语分类/翻译走 POST {base_url}/chat/completions，
+# base_url 需自带对应后缀，故只列云端 /v1 系预设，不含本地Ollama/LM Studio） =====
+GLOSSARY_LLM_PRESETS = {
+    "Agnes(默认)": {
+        "base_url": "https://api.agnes-ai.cn/v1",
+        "model": "agnes-2.5-flash",
+        "hint": "Agnes国内OpenAI兼容，术语分类速度快；在 https://platform.agnes-ai.cn 获取API Key，Base已指向网关 https://api.agnes-ai.cn/v1",
+    },
+}
+for _glossary_preset_name in ("硅基流动", "DeepSeek", "Groq", "智谱AI", "阿里云百炼", "字节豆包", "月之暗面Kimi", "OpenAI官方"):
+    GLOSSARY_LLM_PRESETS[_glossary_preset_name] = {
+        k: PRESETS[_glossary_preset_name][k] for k in ("base_url", "model", "hint")
+    }
+# 本地部署（OpenAI兼容）：base_url 需带 /v1 术语接口才会拼对；Key 本地可留空
+GLOSSARY_LLM_PRESETS["Ollama本地"] = {
+    "base_url": "http://localhost:11434/v1",
+    "model": "qwen3:8b",
+    "hint": "Ollama 本地（免费离线）。确保已启动 ollama serve，点「获取模型」列出已拉取的模型；Key 留空即可",
+}
+GLOSSARY_LLM_PRESETS["LM Studio本地"] = {
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "",
+    "hint": "LM Studio 本地（免费离线）。加载模型后点「获取模型」自动列出；Key 填任意非空字符串",
 }
 
 # 费用预估费率（每百万字符，人民币；免费额度内不计费）
@@ -1348,6 +1740,7 @@ COST_RATES = {
     "OpenAI兼容(硅基流动/Groq/DeepSeek等)": {"type": "per_token", "note": "LLM按token计费，取决于具体模型"},
     "Google Gemini": {"type": "per_token", "note": "免费层有限速，超出按token计费"},
     "Ollama本地模型": {"type": "free", "note": "完全免费离线"},
+    "LM Studio本地": {"type": "free", "note": "完全免费离线（本地推理）"},
 }
 
 # 常见模型每百万token价格（人民币，输入+输出综合估算，取输出价为主）
@@ -1385,9 +1778,9 @@ MODEL_PRICES = {
     "MiniMaxAI/MiniMax-M2.5": 8.4,
     "nex-agi/Nex-N2-Pro": 7.0,
     "moonshotai/Kimi-K2.7-Code": 27.0,
-    # ===== DeepSeek官方 =====
-    "deepseek-chat": 2.0,
-    "deepseek-reasoner": 4.0,
+    # ===== DeepSeek官方（V4 输出价，deepseek-chat/reasoner 已于 2026-07-24 下线）=====
+    "deepseek-v4-flash": 9.0,
+    "deepseek-v4-pro": 27.0,
     # ===== 豆包 =====
     "doubao-1-5-lite-32k-250115": 0.3,
     "doubao-1-5-pro-32k-250115": 2.0,
@@ -1440,6 +1833,7 @@ ENGINE_RECOMMENDED_WORKERS = {
     "OpenAI兼容(硅基流动/Groq/DeepSeek等)": 4,  # 免费模型QPS低，4安全；付费模型可手动调高
     "Google Gemini": 4,          # 免费层15次/分钟
     "Ollama本地模型": 1,         # 本地GPU，并发太高反而慢且易超时，建议1
+    "LM Studio本地": 4,        # LM Studio支持并行推理（Settings里配Parallel N），用户机器OK时可高并发
 }
 
 LANGUAGES = [
@@ -1513,12 +1907,18 @@ class TranslatorApp:
         # Unity 提取文件特征：命中特征码后启用 Unity 专属乱码跳过模式
         self._unity_skip_mode = False
         self._file_meta = None
+        # 失败流转阶段标记：主翻译100%完成后进入失败流转（30s限流等待+2线程重试），
+        # 此阶段is_running仍为True但不是异常，watchdog应跳过"60秒无新进度"提示
+        self._in_retry_phase = False
 
         # 新增功能变量
         self.dark_mode = tk.BooleanVar(value=False)
         self.webhook_url = tk.StringVar()
         self.webhook_type = tk.StringVar(value="generic")  # generic / dingtalk / wecom
         self.refine_mode = tk.BooleanVar(value=False)  # 预翻译+LLM精修模式
+        # 自动关闭LLM的"思考模式/思维链"：翻译是直译任务不需要CoT，
+        # 开思考会多耗token、拖慢速度、思考内容还可能污染译文
+        self.disable_thinking = tk.BooleanVar(value=True)
         self.refine_threshold = tk.IntVar(value=60)  # 质量分数低于此值则精修
         self.refine_workers = tk.IntVar(value=4)  # 精修阶段独立并发数（免费LLM模型QPS低，4安全）
         self.refine_pre_engine = tk.StringVar(value="谷歌翻译")  # 预翻译引擎
@@ -1566,6 +1966,21 @@ class TranslatorApp:
             self._plugin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
 
         # ===== 持久化翻译缓存（跨会话复用, 减少重复API调用/省钱）=====
+        # ===== 术语引擎目录：启动即自动创建，后续每个游戏使用独立子目录 =====
+        self._glossary_root = os.path.join(os.path.dirname(self._config_file), "glossary")
+        self._glossary_project_dir = None
+        self._glossary_project_key = None
+        self.glossary_ai_base_url = tk.StringVar(value=AGNES_CHAT_BASE)
+        self.glossary_ai_api_key = tk.StringVar()
+        self.glossary_ai_model = tk.StringVar(value="agnes-2.5-flash")
+        self.glossary_ai_preset = tk.StringVar(value="Agnes(默认)")
+        self.glossary_auto_threshold = 30
+        try:
+            os.makedirs(self._glossary_root, exist_ok=True)
+        except Exception:
+            pass
+
+        # ===== 持久化翻译缓存（跨会话复用, 减少重复API调用/省钱）=====
         self._cache_file = os.path.join(os.path.dirname(self._config_file), "translation_cache.json")
         self._cache_dirty = 0
 
@@ -1586,6 +2001,9 @@ class TranslatorApp:
         self._setup_auto_save()
         self._load_plugins()
         self._load_translation_cache()
+        # 如果配置中已经有输入文件，启动后立即建立对应游戏术语库并刷新术语引擎标签页；不自动调用AI，避免无意消耗额度。
+        if self.input_file.get() and os.path.isfile(self.input_file.get()):
+            self._glossary_reload_ui()
 
     def _build_ui(self):
         # 菜单栏
@@ -1759,6 +2177,11 @@ class TranslatorApp:
         ttk.Label(semantic_frame, text="（与剧情文本相似度低于此值 → 判为非自然语言免翻）", foreground="gray").grid(row=1, column=3, sticky=tk.W, padx=(4, 0), pady=(4, 2))
         ttk.Label(semantic_frame, text="说明：①②是独立开关，①管翻译后校验译文，②管翻译前过滤垃圾，可同时勾选", foreground="gray").grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=5, pady=(2, 0))
 
+        # ===== 页1b：术语引擎（紧跟基本设置） =====
+        tab_glossary = ttk.Frame(nb, padding=10)
+        nb.add(tab_glossary, text="术语引擎")
+        self._build_glossary_tab(tab_glossary)
+
         # ===== 页2：API设置 =====
         tab2 = ttk.Frame(nb, padding=10)
         nb.add(tab2, text="API设置")
@@ -1799,14 +2222,29 @@ class TranslatorApp:
         self.api_key_entry.grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
         ttk.Button(param_frame, text="显示/隐藏", command=self._toggle_key).grid(row=2, column=2, padx=5, pady=2)
 
-        ttk.Label(param_frame, text="API ID:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.api_id_entry = ttk.Entry(param_frame, textvariable=self.api_id, width=40)
-        self.api_id_entry.grid(row=3, column=1, padx=5, pady=2, sticky=tk.W)
+        # 自动关闭LLM思考模式（紧贴 API Key 下方，不展开就能看到 + 实时状态提示）
+        self.no_think_frame = ttk.Frame(param_frame)
+        self.no_think_frame.grid(row=3, column=0, columnspan=4, sticky=tk.W+tk.E, padx=5, pady=(5, 2))
+        ttk.Checkbutton(self.no_think_frame, text="自动关闭LLM思考模式（省token/加速）",
+                        variable=self.disable_thinking, command=self._refresh_no_think_hint).pack(side=tk.LEFT)
+        self.no_think_hint_var = tk.StringVar(value="")
+        self.no_think_hint = ttk.Label(self.no_think_frame, textvariable=self.no_think_hint_var,
+                                       foreground="gray")
+        self.no_think_hint.pack(side=tk.LEFT, padx=(15, 0))
+        # 实时跟踪 model / base_url / 引擎变化，更新提示
+        self.model.trace_add('write', lambda *a: self.root.after(0, self._refresh_no_think_hint))
+        self.base_url.trace_add('write', lambda *a: self.root.after(0, self._refresh_no_think_hint))
+        self.api_engine.trace_add('write', lambda *a: self.root.after(0, self._refresh_no_think_hint))
+        self.root.after(200, self._refresh_no_think_hint)
 
-        ttk.Label(param_frame, text="MyMemory邮箱:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Label(param_frame, text="API ID:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.api_id_entry = ttk.Entry(param_frame, textvariable=self.api_id, width=40)
+        self.api_id_entry.grid(row=4, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(param_frame, text="MyMemory邮箱:").grid(row=5, column=0, sticky=tk.W, pady=2)
         self.email_entry = ttk.Entry(param_frame, textvariable=self.mymemory_email, width=40)
-        self.email_entry.grid(row=4, column=1, padx=5, pady=2, sticky=tk.W)
-        ttk.Label(param_frame, text="(填写后限额从5千/天提升至5万/天)", foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
+        self.email_entry.grid(row=5, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(param_frame, text="(填写后限额从5千/天提升至5万/天)", foreground="gray").grid(row=5, column=2, sticky=tk.W, padx=5)
 
         # ===== 代理设置（折叠式，默认收起，CF Worker代理防限流） =====
         self._proxy_expanded = False
@@ -1903,7 +2341,8 @@ class TranslatorApp:
 【LLM大模型引擎】
 • OpenAI兼容 - 通用接口，支持硅基流动/Groq/DeepSeek/豆包/百炼/Kimi/智谱/OpenAI等，点"获取模型"自动拉取模型列表
 • Google Gemini - 谷歌官方，gemini-1.5-flash免费层每分钟15次请求
-• Ollama本地模型 - 完全离线免费，需先安装Ollama并拉取模型
+• Ollama本地模型 - 完全离线免费，需先安装Ollama并拉取模型（默认端口11434）
+• LM Studio本地 - 完全离线免费，启动LM Studio加载模型即可（默认端口1234+v1），日→中galgame推荐Sakura-Galtransl-7B
 
 【高级功能】
 • 暂停/继续 - 翻译中可暂停，当前批次完成后等待，继续不丢失进度
@@ -2024,13 +2463,14 @@ class TranslatorApp:
                 pass
 
     def _manual_cache_warmup(self):
-        """手动执行当前语言方向的DeepSeek缓存预热。"""
+        """手动执行当前语言方向的 Prompt Cache 预热（DeepSeek / TokenHub）。"""
         try:
             translator = self._get_translator()
             if isinstance(translator, OpenAICompatTranslator):
                 translator._glossary = self._glossary_text
-            if not isinstance(translator, OpenAICompatTranslator) or not translator._is_deepseek():
-                messagebox.showinfo("缓存预热", "当前引擎不是DeepSeek Prompt Cache模式，无需执行缓存预热。")
+            if not isinstance(translator, OpenAICompatTranslator) or not (
+                    translator._is_deepseek() or translator._is_tokenhub()):
+                messagebox.showinfo("缓存预热", "当前引擎不支持 Prompt Cache 预热，无需执行。")
                 return
             src = self._get_lang_code(self.source_lang.get())
             tgt = self._get_lang_code(self.target_lang.get())
@@ -2065,10 +2505,10 @@ class TranslatorApp:
         ttk.Label(frame, text="提示：DeepSeek读取 prompt_cache_hit_tokens/miss_tokens；TokenHub兼容 cached_tokens/cache_read_tokens/cache_write_tokens，并为同一任务固定 prompt_cache_key + X-Session-ID。", foreground="gray", wraplength=490).pack(anchor=tk.W, pady=(8, 0))
         ttk.Label(
             frame,
-            text="DeepSeek峰谷计费时间表（北京时间）：\n"
-                 "  ⛰ 高峰（全价）：08:30 – 次日 00:30\n"
-                 "  🌙 空闲（约半价）：00:30 – 08:30\n"
-                 "  22:30 后建议大批量任务留到 00:30 后跑，缓存+错峰双重省钱。",
+            text="DeepSeek峰谷计费时间表（北京时间，2026-09 官方口径）：\n"
+                 "  ⛰ 高峰（全价）：工作日 09:00–12:00、14:00–18:00\n"
+                 "  🌙 半价：其余全部时段（含工作日午休/晚间/深夜与整个周末）\n"
+                 "  大批量任务放到 18:00 之后或周末跑，缓存+错峰双重省钱。",
             foreground="gray", justify=tk.LEFT, wraplength=490).pack(anchor=tk.W, pady=(4, 0))
         ttk.Button(frame, text="关闭", command=lambda: (win.grab_release(), win.destroy())).pack(anchor=tk.E, pady=(12, 0))
 
@@ -2338,6 +2778,8 @@ class TranslatorApp:
         self.pre_base_url_entry.config(state="normal" if engine_cls.need_base_url else "disabled")
         self.pre_model_entry.config(state="normal" if engine_cls.need_model else "disabled")
         self.pre_email_entry.config(state="normal" if engine_cls.need_email else "disabled")
+        # 注意：不要在这里刷新主引擎的 no_think_hint 提示——预翻译引擎与主提示无关，
+        # 而且 _build_ui 末尾调用本方法时 tab2 还没构建，no_think_hint_var 还不存在
 
     def _toggle_pre_api(self):
         """展开/收起预翻译API设置"""
@@ -2349,6 +2791,54 @@ class TranslatorApp:
             self._pre_api_content.grid(row=4, column=0, columnspan=7, sticky=tk.W, padx=5, pady=2)
             self._pre_api_toggle.config(text="收起API设置 ▲")
             self._pre_api_expanded = True
+
+    def _refresh_no_think_hint(self):
+        """根据当前 model/base_url 实时刷新「自动关闭思考」状态的提示文字。
+
+        在用户切换快速预设/精修引擎时调用，让 UI 立刻反映
+        当前模型是否已被自动关闭思考、还是主动不传参。
+        """
+        # 只对 OpenAI 兼容引擎有意义
+        if self.api_engine.get() != "OpenAI兼容(硅基流动/Groq/DeepSeek等)":
+            self.no_think_hint_var.set("（当前引擎非OpenAI兼容模式，不适用）")
+            return
+        if not self.disable_thinking.get():
+            self.no_think_hint_var.set("（勾选关闭后才会自动关闭思考）")
+            return
+        # 从显示名提取真实模型名（与 _get_translator 一致）
+        model_display = self.model.get()
+        model = self.model_price_map.get(model_display, model_display)
+        base_url = self.base_url.get()
+        fields = build_no_think_fields(model, base_url)
+        m = (model or '').lower()
+        b = (base_url or '').lower()
+        if fields:
+            # 识别厂商给出友好提示
+            if 'glm' in m or 'bigmodel.cn' in b or 'z.ai' in b:
+                self.no_think_hint_var.set("✓ 已自动关闭 智谱 GLM 思考（thinking.type=disabled）")
+            elif 'qwen' in m or 'dashscope' in b or 'bailian' in b or 'modelscope' in b:
+                if 'localhost' in b or '127.0.0.1' in b or ':8000' in b:
+                    self.no_think_hint_var.set("✓ 已自动关闭 千问 思考（chat_template_kwargs 硬开关）")
+                else:
+                    self.no_think_hint_var.set("✓ 已自动关闭 千问 Qwen 思考（enable_thinking=false）")
+            elif 'kimi' in m or 'moonshot' in b:
+                self.no_think_hint_var.set("✓ 已自动关闭 Kimi 思考（enable_thinking=false）")
+            elif 'minimax' in m:
+                self.no_think_hint_var.set("✓ 已自动关闭 MiniMax 思考（thinking.type=disabled）")
+            elif 'deepseek' in m or 'deepseek' in b:
+                self.no_think_hint_var.set("✓ 已自动关闭 DeepSeek V4 思考（thinking.type=disabled）")
+            else:
+                self.no_think_hint_var.set("✓ 已自动关闭当前模型思考模式")
+        else:
+            # 不传参：解释原因
+            if 'reasoner' in m or m.endswith('-r1') or '-r1-' in m:
+                self.no_think_hint_var.set("⚠ 该 DeepSeek 模型名疑似强制思考旧版（已下线），请改用 deepseek-v4-flash 并勾选自动关闭思考")
+            elif 'api.deepseek.com' in b:
+                self.no_think_hint_var.set("✓ DeepSeek 官方 V4 思考已自动关闭（thinking.type=disabled）")
+            elif 'localhost' in b or '127.0.0.1' in b:
+                self.no_think_hint_var.set("（本地模型不传参，避免 LM Studio 等拒绝未知字段）")
+            else:
+                self.no_think_hint_var.set("（当前模型/服务不识别，不自动传参以保安全）")
 
     def _on_api_change(self, event=None):
         engine_name = self.api_engine.get()
@@ -2428,6 +2918,7 @@ class TranslatorApp:
             self.max_workers.set(rec)
             self.refine_workers.set(rec)
         self._log(f"已加载预设: {preset_name}")
+        self._refresh_no_think_hint()
 
     # ===== 引擎B相关方法 =====
 
@@ -2502,7 +2993,8 @@ class TranslatorApp:
             api_id="",
             model=model,
             base_url=base,
-            email=""
+            email="",
+            disable_thinking=self.disable_thinking.get()
         )
 
     def _test_connection_b(self):
@@ -2644,6 +3136,582 @@ class TranslatorApp:
         except Exception as e:
             self._log(f"拖拽启用失败: {e}。如需拖拽功能，请执行: pip install tkinterdnd2")
 
+    def _init_glossary_for_game(self, game_path):
+        """为当前游戏自动创建独立术语表目录，并加载该游戏自己的LLM术语表。"""
+        try:
+            game_dir = os.path.abspath(game_path)
+            if os.path.isfile(game_dir):
+                game_dir = os.path.dirname(game_dir)
+            game_name = os.path.basename(os.path.normpath(game_dir)) or "game"
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', game_name).strip(" .") or "game"
+            fingerprint = hashlib.sha1(game_dir.lower().encode("utf-8", errors="ignore")).hexdigest()[:10]
+            project_key = f"{safe_name}__{fingerprint}"
+            project_dir = os.path.join(self._glossary_root, project_key)
+            os.makedirs(project_dir, exist_ok=True)
+
+            defaults = {
+                "llm_terms.json": {},
+                "pending_terms.json": [],
+                "character_relations.json": {},
+            }
+            for filename, default in defaults.items():
+                path = os.path.join(project_dir, filename)
+                if not os.path.exists(path):
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(default, f, ensure_ascii=False, indent=2)
+
+            glossary_file = os.path.join(project_dir, "llm_terms.json")
+            glossary_lines = []
+            with open(glossary_file, "r", encoding="utf-8") as f:
+                terms = json.load(f)
+            if isinstance(terms, dict):
+                for source, value in terms.items():
+                    if isinstance(value, dict):
+                        target = value.get("translation") or value.get("target") or value.get("译文") or ""
+                    else:
+                        target = str(value)
+                    if target:
+                        glossary_lines.append(f"{source} = {target}")
+            self._glossary_project_dir = project_dir
+            self._glossary_project_key = project_key
+            self._glossary_text = "\n".join(glossary_lines)
+            self._log(f"术语表已就绪：{project_key}")
+        except Exception as e:
+            self._log(f"术语表自动创建失败（不影响翻译）：{e}")
+
+    def _glossary_paths(self):
+        """返回当前游戏术语引擎的三个持久化文件路径。"""
+        if not self._glossary_project_dir:
+            return None
+        return {name: os.path.join(self._glossary_project_dir, name) for name in (
+            "llm_terms.json", "pending_terms.json", "character_relations.json")}
+
+    def _glossary_load_json(self, name, default):
+        paths = self._glossary_paths()
+        if not paths:
+            return default
+        try:
+            with open(paths[name], "r", encoding="utf-8") as f:
+                value = json.load(f)
+            return value
+        except Exception:
+            return default
+
+    def _glossary_save_json(self, name, value):
+        paths = self._glossary_paths()
+        if not paths:
+            return
+        tmp = paths[name] + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, paths[name])
+
+    def _glossary_extract_candidates(self, data, limit=3000):
+        """零API成本预筛术语候选：从游戏文本中提取适合做实体术语的短语。"""
+        texts = []
+        def walk(v):
+            if len(texts) >= limit:
+                return
+            if isinstance(v, str):
+                s = v.strip()
+                if 2 <= len(s) <= 80 and not self._should_skip_translation(s):
+                    texts.append(s)
+            elif isinstance(v, dict):
+                for k, x in v.items():
+                    if isinstance(k, str) and 2 <= len(k) <= 80:
+                        texts.append(k.strip())
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+        walk(data)
+        # 去重，同时优先保留包含日文/中文/英文首字母大写的疑似专名
+        seen = set(); out = []
+        for s in texts:
+            key = re.sub(r"\s+", " ", s)
+            if key in seen:
+                continue
+            seen.add(key)
+            if re.search(r"[A-Z][A-Za-z]{1,}|[\u3040-\u30ff]|[\u4e00-\u9fff]", key):
+                out.append(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _glossary_agnes_classify(self, candidates):
+        """术语分类（单批，兼容旧调用）：返回保留的 [{source,category,confidence}] 列表。"""
+        kept, _ = self._glossary_agnes_classify_batch(candidates)
+        return kept
+
+    def _glossary_agnes_classify_batch(self, candidates):
+        """调用术语AI对一批候选做分类。
+        返回 (kept, stats)：kept 为通过过滤的项；stats={'model','kept','dropped'} 用于界面展示，
+        0 个也不再是静默——解析失败/空返回会给出可读原因。"""
+        if not candidates:
+            return [], {"model": 0, "kept": 0, "dropped": 0}
+        v = self._glossary_openai()
+        if not v["api_key"] and not v["is_local"]:
+            raise RuntimeError("术语AI需要API Key：请在术语AI填Key（本地Ollama/LM Studio可留空），或切换主引擎为OpenAI兼容并留空术语Key以复用主引擎参数。")
+        prompt = """你是游戏本地化术语抽取器。只从候选文本中选择真正应该固定翻译的专有名词，并分类。
+允许分类只有：人名、地名、阵营、角色、职业、技能、装备、道具、怪物、特殊组织、其他。
+不要选择普通动词、形容词、完整句子、UI通用词、数字、代码、占位符。
+输出严格JSON数组，每项格式：{"source":"原词","category":"分类","confidence":0.0到1.0}。
+不要输出解释。候选：\n""" + "\n".join(f"{i+1}. {x}" for i, x in enumerate(candidates))
+        data = {"model": v["model"], "messages": [{"role": "system", "content": "你是严谨的游戏术语抽取器，只输出JSON。"}, {"role": "user", "content": prompt}], "temperature": 0.1, "max_tokens": 4096}
+        obj = self._glossary_chat_request(v, data)
+        content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+        items = _glossary_parse_ai_array(content)
+        if items is None:
+            raise RuntimeError("术语AI返回了无法解析的内容（不是JSON数组）：\n" + (content or "(空)")[:300])
+        kept, dropped = [], 0
+        for x in items:
+            if not isinstance(x, dict):
+                dropped += 1
+                continue
+            src = str(x.get("source") or "").strip()
+            if not src:
+                dropped += 1
+                continue
+            cat = _GLOSSARY_CAT_MAP.get(str(x.get("category") or "").strip(), str(x.get("category") or "").strip())
+            if cat not in _GLOSSARY_ALLOWED_CATS:
+                dropped += 1
+                continue
+            conf = _glossary_to_conf(x.get("confidence"))
+            if conf < 0.5:
+                dropped += 1
+                continue
+            kept.append({"source": src, "category": cat, "confidence": conf})
+        return kept, {"model": len(items), "kept": len(kept), "dropped": dropped}
+
+    def _glossary_translate_terms(self, terms, target_lang):
+        """独立术语翻译：只翻译已分类术语，不把整张术语表塞进主翻译Prompt。"""
+        if not terms:
+            return {}
+        v = self._glossary_openai()
+        if not v["api_key"] and not v["is_local"]:
+            raise RuntimeError("请填写术语AI API Key（本地Ollama/LM Studio可留空）。")
+        rows = list(terms.keys())[:200]
+        prompt = f"把下面游戏术语翻译成{LANG_NAMES.get(target_lang, target_lang)}。每项只输出JSON对象，key必须保持原词，value是简洁统一的游戏译名。不要解释。\n" + "\n".join(rows)
+        data = {"model": v["model"], "messages": [{"role":"system","content":"你是游戏本地化术语翻译器，只输出JSON对象。"},{"role":"user","content":prompt}], "temperature":0.1, "max_tokens":4096}
+        obj = self._glossary_chat_request(v, data)
+        content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+        m = re.search(r"\{.*\}", content, re.S)
+        return json.loads(m.group(0)) if m else {}
+
+    def _glossary_openai(self):
+        """术语AI的OpenAI兼容连接参数解析 → dict(chat_url, api_key, model, is_local, base)。
+        • Key留空且仍停在默认Agnes端点（未自选其它供应商）时，若主引擎是OpenAI兼容且有Key，
+          自动复用主引擎的Base/Key/Model —— 老用户「术语不填靠主引擎」的用法不变；
+        • 一旦用户选了别的端点（Ollama/LM Studio本地或任一云供应商），绝不劫持：本地Key留空放行。"""
+        preset = GLOSSARY_LLM_PRESETS.get(self.glossary_ai_preset.get(), {}) or {}
+        base = self.glossary_ai_base_url.get().strip().rstrip('/')
+        model = self.glossary_ai_model.get().strip()
+        if not base:
+            base = preset.get("base_url") or AGNES_CHAT_BASE
+        if not model:
+            model = preset.get("model") or AGNES_CHAT_MODEL
+        api_key = self.glossary_ai_api_key.get().strip()
+        low = base.lower()
+        on_agnes_default = (not base or _norm_base(base).lower() == AGNES_CHAT_BASE.lower())
+        if (not api_key) and on_agnes_default \
+                and self.api_engine.get() == "OpenAI兼容(硅基流动/Groq/DeepSeek等)" \
+                and self.base_url.get().strip() and self.api_key.get().strip():
+            base = self.base_url.get().strip().rstrip('/')
+            model = self.model.get().strip() or model
+            api_key = self.api_key.get().strip()
+            low = base.lower()
+        is_local = ('localhost' in low or low.startswith(('http://127.0.0.1', 'https://127.0.0.1'))
+                    or ':11434' in low or ':1234' in low)
+        return {"chat_url": _glossary_chat_url(base), "base": base,
+                "api_key": api_key, "model": model, "is_local": is_local}
+
+    def _glossary_chat_request(self, v, payload, timeout=120):
+        """POST OpenAI兼容 /chat/completions。本地端点自动绕过系统代理（否则localhost被代理拦成502）。"""
+        headers = {"Content-Type": "application/json"}
+        if v.get("api_key"):
+            headers["Authorization"] = "Bearer " + v["api_key"]
+        req = urllib.request.Request(v["chat_url"], data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                     headers=headers, method="POST")
+        ctx = ssl._create_unverified_context()
+        if v.get("is_local"):
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _glossary_fetch_models(self):
+        """获取当前术语AI Base URL 的模型列表，填充 Model 下拉。
+        依次尝试 /models 变体（见 _glossary_models_urls），404 自动试下一个端点。"""
+        v = self._glossary_openai()
+        if not v["base"]:
+            messagebox.showwarning("提示", "请先填写术语AI Base URL")
+            return
+        if not v["api_key"] and not v["is_local"]:
+            messagebox.showwarning("提示", "请先填写术语AI API Key，或在预设里选择Ollama/LM Studio本地项。")
+            return
+        urls = _glossary_models_urls(v["base"])
+        if not urls:
+            messagebox.showwarning("提示", "Base URL 无效")
+            return
+        self._log(f"术语AI 获取模型，候选端点: {urls}")
+        self._glossary_progress_start(indeterminate=True, text="获取模型列表中…")
+        def worker():
+            headers = {"User-Agent": "Mozilla/5.0"}
+            if v["api_key"]:
+                headers["Authorization"] = "Bearer " + v["api_key"]
+            ctx = ssl._create_unverified_context()
+            last_err = ""
+            for url in urls:
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    if v["is_local"]:
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        resp = opener.open(req, timeout=30)
+                    else:
+                        resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+                    data = json.loads(resp.read().decode("utf-8"))
+                    models = _glossary_parse_models(data)
+                    if models:
+                        self._glossary_progress_stop()
+                        self.root.after(0, lambda ms=models: self.glossary_model_combo.configure(values=ms))
+                        self.root.after(0, lambda ms=models: self.glossary_ai_model.set(ms[0]))
+                        self._log(f"术语AI 获取到 {len(models)} 个模型（{url}）")
+                        return
+                    last_err = f"端点 {url} 返回200但无模型字段"
+                    self._log(f"  术语AI {last_err}，尝试下一个…")
+                except urllib.error.HTTPError as e:
+                    last_err = f"{e.code} {e.reason} @ {url}"
+                    self._log(f"  术语AI {last_err}，尝试下一个…")
+                except Exception as e:
+                    last_err = f"{e} @ {url}"
+                    self._log(f"  术语AI {last_err}，尝试下一个…")
+            # Agnes 系无 /models 接口 → 按官方模型目录兜底填充，避免无意义的404弹窗
+            try:
+                host = urllib.parse.urlparse(v["base"]).netloc.lower()
+            except Exception:
+                host = ""
+            if "agnes" in host:
+                self._glossary_progress_stop()
+                self.root.after(0, lambda: self.glossary_model_combo.configure(values=AGNES_KNOWN_MODELS))
+                if v["model"] not in AGNES_KNOWN_MODELS:
+                    self.root.after(0, lambda: self.glossary_ai_model.set(AGNES_KNOWN_MODELS[0]))
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "获取模型",
+                    "Agnes 未提供模型列表接口(/models)，已按官方模型目录自动填充。\n\n" +
+                    "可手动编辑 Model 下拉框输入其它模型名。"))
+                self._log("术语AI Agnes无/models接口，改用内置官方模型目录")
+                return
+            self._glossary_progress_stop()
+            self.root.after(0, lambda le=last_err: messagebox.showerror(
+                "获取模型失败",
+                f"{le}\n\n已依次尝试：\n" + "\n".join(urls) +
+                "\n\n请确认服务地址/Key正确：Ollama 需已启动(ollama serve)；LM Studio 需先加载模型。"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _glossary_test_connection(self):
+        """用极小的一次 chat/completions 请求测试术语AI连接与Key是否可用。"""
+        try:
+            v = self._glossary_openai()
+            if not v["api_key"] and not v["is_local"]:
+                raise RuntimeError("术语AI需要API Key：请先填Key，或改用Ollama/LM Studio本地预设。")
+        except Exception as e:
+            messagebox.showwarning("无法测试", str(e))
+            return
+        self._log(f"术语AI 测试连接: {v['chat_url']}  model={v['model']}")
+        self._glossary_progress_start(indeterminate=True, text="测试连接中…")
+        def worker():
+            try:
+                payload = {"model": v["model"], "max_tokens": 8,
+                           "messages": [{"role": "user", "content": "ping"}]}
+                obj = self._glossary_chat_request(v, payload, timeout=45)
+                ok = bool(obj and obj.get("choices"))
+                self._glossary_progress_stop()
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "测试连接",
+                    ("连接成功 ✓\n" + (f"回复: {obj['choices'][0]['message'].get('content','')[:60]}" if ok else "接口返回异常（无choices）。")))
+                    if ok else messagebox.showwarning("测试连接", "接口返回异常（无choices）。"))
+            except Exception as e:
+                self._glossary_progress_stop()
+                self.root.after(0, lambda e=e: messagebox.showerror("测试连接失败", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _glossary_auto_prepare(self):
+        """导入/开始翻译时自动预筛；累计到阈值后后台AI分类，避免每条文本单独请求。"""
+        try:
+            if not self._glossary_project_dir or not self.input_file.get():
+                return
+            with open(self.input_file.get(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cand = self._glossary_extract_candidates(data, limit=3000)
+            pending = self._glossary_load_json("pending_terms.json", [])
+            pending = list(dict.fromkeys(pending + cand))
+            self._glossary_save_json("pending_terms.json", pending)
+            if len(pending) >= self.glossary_auto_threshold and self.glossary_ai_api_key.get().strip():
+                def worker(items):
+                    try:
+                        result = self._glossary_agnes_classify(items[:300])
+                        terms = self._glossary_load_json("llm_terms.json", {})
+                        for x in result:
+                            src = x["source"]
+                            old = terms.get(src, {}) if isinstance(terms.get(src, {}), dict) else {"translation": str(terms.get(src, ""))}
+                            old.update({"source":src,"category":x["category"],"confidence":x.get("confidence",0)})
+                            terms[src] = old
+                        self._glossary_save_json("llm_terms.json", terms)
+                        done = {x["source"] for x in result}
+                        self._glossary_save_json("pending_terms.json", [x for x in pending if x not in done])
+                        self.root.after(0, self._glossary_reload_ui)
+                    except Exception as e:
+                        self._log(f"术语AI自动分类暂时失败：{e}")
+                threading.Thread(target=worker, args=(pending,), daemon=True).start()
+            self._log(f"术语引擎：自动预筛 {len(cand)} 个候选，待分类 {len(pending)} 个")
+        except Exception as e:
+            self._log(f"术语自动预筛跳过：{e}")
+
+    def _build_glossary_tab(self, parent):
+        """术语引擎（当前游戏独立术语库）——作为主窗口标签页，紧跟「基本设置」。
+        原「工具→术语引擎」弹窗改为常驻标签页：候选提取、AI分类、术语维护、当前游戏隔离。"""
+        head = ttk.Frame(parent); head.pack(fill=tk.X, pady=(0, 3))
+        self._glossary_head_game = tk.StringVar(value="尚未选择游戏")
+        ttk.Label(head, textvariable=self._glossary_head_game, font=("微软雅黑", 10, "bold")).pack(anchor=tk.W)
+        ttk.Label(head, text="AI只负责分类，翻译引擎负责翻译；术语库按游戏目录隔离，不会跨游戏混用。",
+                  foreground="gray").pack(anchor=tk.W, pady=(2, 0))
+        self._glossary_head_stat = tk.StringVar(value="准备就绪")
+        ttk.Label(head, textvariable=self._glossary_head_stat).pack(anchor=tk.W, pady=(3, 0))
+
+        cfg = ttk.LabelFrame(parent, text="术语AI（LLM预设 · OpenAI兼容）", padding=6)
+        cfg.pack(fill=tk.X, pady=(2, 5))
+        ttk.Label(cfg, text="LLM预设:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=(2, 0))
+        self.glossary_preset_combo = ttk.Combobox(cfg, textvariable=self.glossary_ai_preset,
+                                                  values=list(GLOSSARY_LLM_PRESETS.keys()),
+                                                  state="readonly", width=32)
+        self.glossary_preset_combo.grid(row=0, column=1, columnspan=3, sticky=tk.W, padx=4, pady=(2, 0))
+        self.glossary_preset_combo.bind("<<ComboboxSelected>>", self._on_glossary_preset_change)
+        self._glossary_preset_hint = tk.StringVar(value=GLOSSARY_LLM_PRESETS["Agnes(默认)"]["hint"])
+        ttk.Label(cfg, textvariable=self._glossary_preset_hint, foreground="gray", wraplength=780).grid(row=1, column=0, columnspan=4, sticky=tk.W, padx=4, pady=(0, 4))
+        ttk.Label(cfg, text="Base URL").grid(row=2, column=0, sticky=tk.W, padx=4, pady=2)
+        ttk.Entry(cfg, textvariable=self.glossary_ai_base_url, width=28).grid(row=2, column=1, padx=4, pady=2)
+        ttk.Label(cfg, text="Key").grid(row=2, column=2, sticky=tk.W, padx=4, pady=2)
+        ttk.Entry(cfg, textvariable=self.glossary_ai_api_key, width=16, show="*").grid(row=2, column=3, padx=4, pady=2, sticky=tk.W)
+        ttk.Label(cfg, text="Model").grid(row=3, column=0, sticky=tk.W, padx=4, pady=2)
+        self.glossary_model_combo = ttk.Combobox(cfg, textvariable=self.glossary_ai_model, width=28)
+        self.glossary_model_combo.grid(row=3, column=1, padx=4, pady=2, sticky=tk.W)
+        ttk.Button(cfg, text="获取模型", command=self._glossary_fetch_models).grid(row=3, column=2, padx=4, pady=2)
+        ttk.Button(cfg, text="测试连接", command=self._glossary_test_connection).grid(row=3, column=3, padx=4, pady=2, sticky=tk.W)
+        ttk.Label(cfg, text="本地Ollama/LM Studio可留空Key；累计30个候选后自动批量AI分类（低于30不请求）",
+                  foreground="gray").grid(row=4, column=0, columnspan=4, sticky=tk.W, padx=4, pady=(4, 0))
+
+        body = ttk.Frame(parent); body.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+        self._glossary_view = tk.Text(body, wrap=tk.WORD)
+        ysb = ttk.Scrollbar(body, command=self._glossary_view.yview)
+        self._glossary_view.configure(yscrollcommand=ysb.set)
+        self._glossary_view.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        btn = ttk.Frame(parent); btn.pack(fill=tk.X)
+        ttk.Button(btn, text="扫描游戏文本（零API）", command=self._glossary_scan_now).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn, text="Agnes AI自动分类", command=self._glossary_classify_now).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn, text="AI翻译已分类术语", command=self._glossary_translate_now).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn, text="刷新术语表", command=self._refresh_glossary_view).pack(side=tk.LEFT, padx=5)
+
+        prog = ttk.Frame(parent); prog.pack(fill=tk.X, pady=(2, 2))
+        self._glossary_progress = ttk.Progressbar(prog, mode="indeterminate")
+        self._glossary_progress.pack(fill=tk.X)
+        self._glossary_progress.pack_forget()  # 默认隐藏，AI操作时再显示
+
+        # 若启动时已配置输入文件，立即载入该游戏的术语表
+        self._refresh_glossary_view()
+
+    def _glossary_progress_start(self, indeterminate=True, text=""):
+        """主线程显示进度条（indeterminate=True 跑动指示；False 走 determinate 由 set 推进）。"""
+        def _apply():
+            try:
+                if not getattr(self, "_glossary_progress", None):
+                    return
+                self._glossary_progress.configure(mode="indeterminate" if indeterminate else "determinate",
+                                                  maximum=100, value=0)
+                self._glossary_progress.pack(fill=tk.X)
+                if indeterminate:
+                    self._glossary_progress.start(12)
+                if text:
+                    self._glossary_head_stat.set(text)
+            except Exception:
+                pass
+        self.root.after(0, _apply)
+
+    def _glossary_progress_set(self, fraction, text):
+        """主线程推进 determinate 进度条并更新状态文字。"""
+        def _apply():
+            try:
+                if not getattr(self, "_glossary_progress", None):
+                    return
+                try:
+                    self._glossary_progress.stop()
+                except Exception:
+                    pass
+                self._glossary_progress.configure(mode="determinate")
+                self._glossary_progress.pack(fill=tk.X)
+                self._glossary_progress.configure(value=max(0.0, min(100.0, fraction * 100.0)))
+                if text:
+                    self._glossary_head_stat.set(text)
+            except Exception:
+                pass
+        self.root.after(0, _apply)
+
+    def _glossary_progress_stop(self, text=None):
+        """主线程收起进度条，可选写入最终状态。"""
+        def _apply():
+            try:
+                if not getattr(self, "_glossary_progress", None):
+                    return
+                try:
+                    self._glossary_progress.stop()
+                except Exception:
+                    pass
+                self._glossary_progress.pack_forget()
+                if text:
+                    self._glossary_head_stat.set(text)
+            except Exception:
+                pass
+        self.root.after(0, _apply)
+
+    def _on_glossary_preset_change(self, event=None):
+        """术语AI选择LLM预设：自动填入 Base URL / Model，并在提示行显示获取Key地址。"""
+        name = self.glossary_ai_preset.get()
+        p = GLOSSARY_LLM_PRESETS.get(name)
+        if not p:
+            return
+        self.glossary_ai_base_url.set(p["base_url"])
+        self.glossary_ai_model.set(p["model"])
+        try:
+            self._glossary_preset_hint.set(p.get("hint", ""))
+        except Exception:
+            pass
+        self._log(f"术语AI已加载预设: {name}（Key 仍留空则翻译术语时回落到主引擎的Key）")
+
+    def _refresh_glossary_view(self):
+        """把当前游戏的术语表重灌进术语引擎标签页文本区（主线程调用）。"""
+        try:
+            if not getattr(self, "_glossary_view", None) or not self._glossary_view.winfo_exists():
+                return
+            if self._glossary_project_key:
+                self._glossary_head_game.set(f"当前游戏：{self._glossary_project_key}")
+            else:
+                self._glossary_head_game.set("尚未选择游戏（先在「基本设置」选择游戏文本JSON）")
+            self._glossary_view.delete("1.0", tk.END)
+            terms = self._glossary_load_json("llm_terms.json", {})
+            if isinstance(terms, dict) and terms:
+                for k, v in terms.items():
+                    cat = v.get("category", "") if isinstance(v, dict) else ""
+                    tgt = (v.get("translation") or v.get("target") or "") if isinstance(v, dict) else str(v)
+                    self._glossary_view.insert(tk.END, f"{k} = {tgt}    [{cat}]\n")
+            else:
+                self._glossary_view.insert(tk.END, "（暂无已分类术语。点击「扫描游戏文本」从当前游戏提取候选，再用 AI 分类。）\n")
+        except Exception as e:
+            self._log(f"术语表视图刷新失败：{e}")
+
+    def _glossary_reload_ui(self):
+        """主线程调用：按当前输入文件重建术语库，并刷新术语引擎标签页。"""
+        try:
+            if self.input_file.get() and os.path.isfile(self.input_file.get()):
+                self._init_glossary_for_game(self.input_file.get())
+        except Exception as e:
+            self._log(f"术语库重建失败：{e}")
+        self._refresh_glossary_view()
+
+    def _glossary_scan_now(self):
+        """零API成本预筛术语候选，追加进待分类列表并展示。"""
+        try:
+            if not self._glossary_project_dir:
+                self._glossary_reload_ui()
+                if not self._glossary_project_dir:
+                    self._glossary_head_stat.set("请先在「基本设置」选择游戏文本JSON")
+                    return
+            with open(self.input_file.get(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cand = self._glossary_extract_candidates(data)
+            pending = self._glossary_load_json("pending_terms.json", [])
+            merged = list(dict.fromkeys(pending + cand))
+            self._glossary_save_json("pending_terms.json", merged)
+            self._glossary_head_stat.set(f"已零成本筛出 {len(cand)} 个候选，待AI分类 {len(merged)} 个")
+            self._glossary_view.insert(tk.END, "\n【候选扫描完成】\n" + "\n".join(cand[:200]) + "\n")
+        except Exception as e:
+            messagebox.showerror("扫描失败", str(e))
+
+    def _glossary_classify_now(self):
+        """手动AI分类：分批跑全部候选（一批≤60，单次上限600），进度条实时推进；
+        结果0个不再静默——给出「模型返回几条 / 过滤几条」的原因。"""
+        def worker():
+            try:
+                pending = self._glossary_load_json("pending_terms.json", [])
+                if not pending:
+                    raise RuntimeError("没有待分类候选，请先「扫描游戏文本」。")
+                total = len(pending)
+                chunk, run_n = 60, min(total, 600)
+                self._glossary_progress_start(indeterminate=False, text=f"AI分类中… 0/{run_n}")
+                terms = self._glossary_load_json("llm_terms.json", {})
+                kept_all, model_n, dropped = [], 0, 0
+                for i in range(0, run_n, chunk):
+                    batch = pending[i:i + chunk]
+                    kept, stats = self._glossary_agnes_classify_batch(batch)
+                    kept_all += kept
+                    model_n += stats["model"]
+                    dropped += stats["dropped"]
+                    self._glossary_progress_set((i + chunk) / run_n,
+                                                f"AI分类中… {min(i + chunk, run_n)}/{run_n}（已归类 {len(kept_all)}）")
+                for x in kept_all:
+                    src = x["source"]
+                    old = terms.get(src, {})
+                    if not isinstance(old, dict):
+                        old = {"translation": str(old)}
+                    old.update({"source": src, "category": x["category"], "confidence": x.get("confidence", 0)})
+                    terms[src] = old
+                self._glossary_save_json("llm_terms.json", terms)
+                done_src = {x["source"] for x in kept_all}
+                remain = [x for x in pending if x not in done_src]
+                self._glossary_save_json("pending_terms.json", remain)
+                self.root.after(0, self._glossary_reload_ui)
+                if kept_all:
+                    msg = f"AI分类完成：保留 {len(kept_all)} 个"
+                    if run_n < total:
+                        msg += f"（本次最多跑 {run_n}，仍剩 {len(remain)} 个候选，可再点一次继续）"
+                    self._glossary_progress_stop(msg)
+                else:
+                    self._glossary_progress_stop("AI分类完成：0 个")
+                    if model_n:
+                        why = (f"AI 本次返回 {model_n} 条，但没有一条通过校验（被过滤 {dropped} 条）。\n\n"
+                               "可能原因：候选多为普通句子/UI词/占位符；或模型给的分类不在允许集合内、置信度低于 0.5。\n"
+                               "建议：先「扫描游戏文本」再分类；必要时在下方文本框核对候选是否含人名/地名/道具名等专名。")
+                    else:
+                        why = ("AI 判定这批候选里没有符合固定翻译的专有名词（返回空）。\n\n"
+                               "可能：候选多是完整句子/对话/普通词，而非人名、地名、道具名等。\n"
+                               "建议：先「扫描游戏文本」多筛一些真专名，再点分类。")
+                    self.root.after(0, lambda w=why: messagebox.showinfo("AI分类：0 个", w))
+            except Exception as e:
+                self._glossary_progress_stop()
+                self.root.after(0, lambda e=e: messagebox.showerror("AI分类失败", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _glossary_translate_now(self):
+        def worker():
+            try:
+                terms_now = self._glossary_load_json("llm_terms.json", {})
+                missing = {k: v for k, v in terms_now.items() if isinstance(v, dict) and not (v.get("translation") or v.get("target"))}
+                if not missing:
+                    raise RuntimeError("没有待翻译的术语。")
+                self._glossary_progress_start(indeterminate=True, text=f"AI术语翻译中… {len(missing)} 条")
+                result = self._glossary_translate_terms(missing, self._get_lang_code(self.target_lang.get()))
+                for k, v in result.items():
+                    if k in terms_now and isinstance(terms_now[k], dict):
+                        terms_now[k]["translation"] = str(v)
+                self._glossary_save_json("llm_terms.json", terms_now)
+                self.root.after(0, self._glossary_reload_ui)
+                self._glossary_progress_stop(f"术语翻译完成：{len(result)} 个")
+            except Exception as e:
+                self._glossary_progress_stop()
+                self.root.after(0, lambda e=e: messagebox.showerror("术语翻译失败", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
     def _on_drop(self, event):
         """处理文件拖放"""
         path = event.data.strip()
@@ -2661,6 +3729,8 @@ class TranslatorApp:
                     path = first
         if path and os.path.isfile(path):
             self.input_file.set(path)
+            self._glossary_reload_ui()
+            self._glossary_auto_prepare()
             d = os.path.dirname(path)
             if not self.output_file.get() or os.path.basename(self.output_file.get()) == "ManualTransFile.json":
                 self.output_file.set(os.path.join(d, "ManualTransFile.json"))
@@ -2674,6 +3744,8 @@ class TranslatorApp:
         f = filedialog.askopenfilename(filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
         if f:
             self.input_file.set(f)
+            self._glossary_reload_ui()
+            self._glossary_auto_prepare()
             d = os.path.dirname(f)
             if not self.output_file.get() or os.path.basename(self.output_file.get()) == "ManualTransFile.json":
                 self.output_file.set(os.path.join(d, "ManualTransFile.json"))
@@ -2728,6 +3800,10 @@ class TranslatorApp:
             model=model, base_url=base,
             email=self.mymemory_email.get()
         )
+        # GUI 控制台 config.json 的请求超时覆盖（仅当存在时生效）
+        gui_timeout = getattr(self, "_gui_timeout", None)
+        if gui_timeout:
+            kwargs['timeout'] = int(gui_timeout)
         if engine_cls is GoogleTranslator:
             kwargs['proxy_list'] = self._parse_google_proxies()
         elif engine_cls is BingTranslator:
@@ -2735,6 +3811,9 @@ class TranslatorApp:
             bing_proxy_str = self.bing_proxy.get().strip()
             if bing_proxy_str:
                 kwargs['proxy_list'] = [p.strip() for p in bing_proxy_str.split(',') if p.strip()]
+        elif engine_cls is OpenAICompatTranslator:
+            # 自动关闭思考模式（翻译场景不需要CoT）
+            kwargs['disable_thinking'] = self.disable_thinking.get()
         return engine_cls(**kwargs)
 
     def _load_existing(self):
@@ -2951,10 +4030,14 @@ class TranslatorApp:
                     "API设置页未配置LLM（API Key / Base URL / 模型），无法精修。\n请先在「API设置」配置后再试。", parent=dlg)
                 return
             # 构造 force_refine 列表（跳过质量筛选，直接精修校准检出的条目）
+            # 注意：本对话框的 issues 是 (source, target, reason, quality) 四元组
             force_items = []
             for idx in selected:
-                source, target, sim = issues_sorted[idx]
+                source, target = issues[idx][0], issues[idx][1]
                 force_items.append((source, target, 0, True))
+            # 本对话框没有 src/tgt 参数，需从当前语言设置推导
+            src = self._get_lang_code(self.source_lang.get())
+            tgt = self._get_lang_code(self.target_lang.get())
             dlg.grab_release()
             # 后台线程执行精修，完成后写回文件
             def _worker():
@@ -2985,7 +4068,7 @@ class TranslatorApp:
                     self.root.after(0, _done)
                 except Exception as e:
                     self._log(f"翻译校准→LLM精修失败: {e}")
-                    def _err():
+                    def _err(e=e):
                         try:
                             if dlg.winfo_exists():
                                 messagebox.showerror("错误", f"精修失败：{e}", parent=dlg)
@@ -3010,16 +4093,17 @@ class TranslatorApp:
         messagebox.showinfo("统计", f"总条目: {len(data)}\n已翻译: {diff}\n未翻译: {len(data)-diff}\n进度文件: {len(self.translated)} 条")
 
     def _classify_error(self, err):
-        """分类错误：rate_limit(限流) / timeout(超时) / auth(授权) / other"""
+        """分类错误：auth(授权，不重试) / rate_limit(限流) / timeout(超时) / other。
+        auth 最先判断：授权错误重试无意义，不能被消息里的其他关键词抢分类。"""
         msg = str(err).lower()
+        if any(k in msg for k in ['401', '403', 'unauthorized', 'forbidden', 'auth', '密钥', '授权', 'invalid key', 'api key']):
+            return 'auth'
         if any(k in msg for k in ['429', 'rate limit', 'too many requests', '限流', 'quota', '频率',
                                     'sorry', 'blocked', 'too many', 'unusual traffic', 'your computer',
                                     'service unavailable', '503', 'temporarily unavailable']):
             return 'rate_limit'
         if any(k in msg for k in ['timeout', 'timed out', '超时', 'connection reset', 'connection refused', '网络']):
             return 'timeout'
-        if any(k in msg for k in ['401', '403', 'unauthorized', 'forbidden', 'auth', '密钥', '授权', 'invalid key', 'api key']):
-            return 'auth'
         return 'other'
 
     def _get_rate_state(self, engine_name):
@@ -3091,6 +4175,16 @@ class TranslatorApp:
         """将文本中的换行符和占位符替换为唯一标记，返回(替换后文本, 映射列表)
         换行符始终保护（防止LLM翻译时丢失换行后的内容），占位符保护可选"""
         mapping = []
+        # 0. 碰撞防护：原文本身含 〔NL0〕/〔PHX0〕 字样时，先保护起来（用独立的
+        #    ⟦LIT⟧ 命名空间+最后还原，否则还原阶段会把它错误还原成换行）
+        if re.search(r'〔(?:NL|PHX)\d+〕', text):
+            lit_count = [0]
+            def _lit_replacer(m):
+                marker = f"⟦LIT{lit_count[0]}⟧"
+                mapping.append((marker, m.group()))
+                lit_count[0] += 1
+                return marker
+            text = re.sub(r'〔(?:NL|PHX)\d+〕', _lit_replacer, text)
         # 1. 始终保护换行符：统一\r\n和\r为\n，再用特殊标记替换
         #    用〔NL{idx}〕格式（中文方括号），LLM和翻译API不易修改或丢弃
         text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -3140,8 +4234,12 @@ class TranslatorApp:
         """将译文中的标记还原为原始占位符（支持大小写不敏感 + 中/英/全角方括号变体），并验证还原结果"""
         if not mapping:
             return text
+        # 字面标记（⟦LIT⟧）最后还原：其还原内容本身形如 〔NL0〕，
+        # 先还原会被后续标记处理/校验二次改写
+        lit = [(mk, orig) for mk, orig in mapping if mk.startswith('⟦LIT')]
+        normal = [(mk, orig) for mk, orig in mapping if not mk.startswith('⟦LIT')]
         result = text
-        for marker, original in mapping:
+        for marker, original in normal:
             # 1. 精确替换（中文直角括号 〔〕）
             result = result.replace(marker, original)
             # 2. 大小写不敏感替换（防止LLM修改了标记大小写）
@@ -3156,7 +4254,7 @@ class TranslatorApp:
         leftover = re.findall(r'[〔\[【]?(?:NL|PHX)\d+[〕\]】]?', result)
         if leftover:
             # 标记未被还原，可能是LLM丢弃了标记的一部分，按各种形式兜底还原
-            for marker, original in mapping:
+            for marker, original in normal:
                 for form in ([marker] + self._marker_alt_forms(marker)):
                     if form in result:
                         result = re.sub(re.escape(form), lambda m: original, result, flags=re.IGNORECASE)
@@ -3164,12 +4262,16 @@ class TranslatorApp:
         #         仅当NL标记被LLM完全丢弃(连变体都没有)时才补回，避免多余堆叠
         leftover_nl = re.findall(r'[〔\[【]NL\d+[〕\]】]', result)
         if not leftover_nl:
-            expected_nl = sum(1 for _, orig in mapping if orig == '\n')
+            expected_nl = sum(1 for _, orig in normal if orig == '\n')
             actual_nl = result.count('\n')
             if expected_nl > 0 and actual_nl < expected_nl:
                 # 译文换行少于原文，补回缺失的换行（保守策略，追加到末尾）
                 missing = expected_nl - actual_nl
                 result = result + '\n' * missing
+        # 字面标记最后还原（此时校验已结束，不会再被改写）
+        for marker, original in lit:
+            result = result.replace(marker, original)
+            result = re.sub(re.escape(marker), lambda m: original, result, flags=re.IGNORECASE)
         return result
 
     def _is_code_or_noise(self, text):
@@ -3383,9 +4485,15 @@ class TranslatorApp:
             elif self._embedding_should_skip(text):
                 return text
         # 翻译缓存：相同文本+语言方向直接返回，避免重复翻译（游戏UI文本重复率高）
-        cache_key = f"{src}|{tgt}|{text}"
+        cache_key = self._cache_text_key(src, tgt, text)
         if cache_key in self.translation_cache:
             return self.translation_cache[cache_key]
+        # 兼容旧版缓存键：首次命中旧键后自动迁移到规范化键，避免升级后重新花API费用。
+        legacy_key = f"{src}|{tgt}|{text}"
+        if legacy_key != cache_key and legacy_key in self.translation_cache:
+            result = self.translation_cache[legacy_key]
+            self.translation_cache[cache_key] = result
+            return result
         chunk_size = self.chunk_size.get()
         max_retry = self.max_retry.get()
 
@@ -3460,8 +4568,9 @@ class TranslatorApp:
                     if len(translator.context) > 10:
                         translator.context = translator.context[-10:]
             final = result if result and result != text else text
-            self.translation_cache[cache_key] = final
-            self._maybe_save_cache()
+            if self._is_cacheable_result(text, final):
+                self.translation_cache[cache_key] = final
+                self._maybe_save_cache()
             return final
 
         protected, mapping = self._protect_text(text)
@@ -3477,10 +4586,33 @@ class TranslatorApp:
             translator.context.append((text, result))
             if len(translator.context) > 10:
                 translator.context = translator.context[-10:]
-        # 存入缓存
-        self.translation_cache[cache_key] = result
-        self._maybe_save_cache()
+        # 存入缓存（失败回退/prompt泄漏/垃圾译文不入缓存，否则永久阻止重试）
+        if self._is_cacheable_result(text, result):
+            self.translation_cache[cache_key] = result
+            self._maybe_save_cache()
         return result
+
+    def _is_cacheable_result(self, text, result):
+        """判断译文是否值得写入持久化缓存。
+
+        失败结果一旦入缓存就会永久阻止重试（实测旧缓存中 18.6% 的条目值等于原文），
+        且 prompt 泄漏/截断类垃圾译文会被反复命中，必须在写入前拦掉。
+        """
+        if not result or not str(result).strip():
+            return False
+        r = str(result)
+        # 1) 与原文完全相同：多为翻译失败后回退原文，不能缓存，否则永不重试
+        if r == text or r.strip() == str(text).strip():
+            return False
+        # 2) prompt 泄漏：模型把指令原样回显
+        for mark in ("请翻译以下文本", "只输出译文", "请逐条翻译以下文本",
+                     "【本句相关术语】", "【本批相关术语】", "【缓存规则】", "【当前任务语言方向】"):
+            if mark in r:
+                return False
+        # 3) 截断/占位垃圾译文
+        if r.strip() in ("「……", "「……」", "……", "「", "」", "…"):
+            return False
+        return True
 
     def _load_translation_cache(self):
         """启动时加载持久化翻译缓存（跨会话复用, 减少重复API调用/省钱）"""
@@ -3489,8 +4621,21 @@ class TranslatorApp:
                 with open(self._cache_file, "r", encoding="utf-8") as f:
                     _c = json.load(f)
                 if isinstance(_c, dict) and _c:
-                    self.translation_cache = _c
-                    self._log(f"📦 已加载 {len(_c)} 条持久化翻译缓存（跨会话复用）")
+                    # 一次性清理历史污染条目：失败/泄漏/垃圾译文会被永久命中
+                    cleaned = {}
+                    dropped = 0
+                    for k, v in _c.items():
+                        parts = str(k).split('|', 2)
+                        src_text = parts[2] if len(parts) == 3 else None
+                        if src_text is not None and not self._is_cacheable_result(src_text, v):
+                            dropped += 1
+                            continue
+                        cleaned[k] = v
+                    self.translation_cache = cleaned
+                    self._log(f"📦 已加载 {len(cleaned)} 条持久化翻译缓存（跨会话复用）")
+                    if dropped:
+                        self._log(f"🧹 已清理 {dropped} 条无效缓存（失败回退/prompt泄漏/截断译文），这些条目将可重新翻译")
+                        self._save_translation_cache()
         except Exception:
             pass
 
@@ -3532,6 +4677,8 @@ class TranslatorApp:
                 messagebox.showwarning("提示", "引擎B已启用但未选择模型")
                 return
 
+        # 翻译开始前先做一次零成本术语预筛；达到阈值且已配置术语AI时后台批量分类。
+        self._glossary_auto_prepare()
         self.is_running = True
         self.should_stop = False
         self.is_paused = False
@@ -3721,12 +4868,11 @@ class TranslatorApp:
                 m = re.match(r'^(?:初译|译文|翻译)\s*[:：]\s*(.+)$', line, re.IGNORECASE)
                 if m:
                     return m.group(1).strip()
-            # 无标签：取第一个非"原文/源文本"前缀的行
-            for line in blines:
-                if re.match(r'^(?:原文|原文文本|源文本)[：:]', line):
-                    continue
-                return line
-            return None
+            # 无标签：拼接除"原文/源文本"前缀外的所有行（多行译文=原文含换行，
+            # 模型把标记输出了真换行；只取首行会丢内容）
+            keep = [line for line in blines
+                    if not re.match(r'^(?:原文|原文文本|源文本)[：:]', line)]
+            return '\n'.join(keep) if keep else None
 
         results = {}
         for idx, blines in blocks:
@@ -3738,9 +4884,11 @@ class TranslatorApp:
                    (content.startswith("'") and content.endswith("'")):
                     content = content[1:-1].strip()
                 results[idx] = content
-        valid = [results[i] for i in sorted(results) if results[i]]
-        if len(valid) == expected_count:
-            return valid
+        # 只有编号恰好是 1..N 连续时才能按编号对应；有缺口时按顺序对齐会错位
+        #（如模型输出 1,2,4 三条，按序返回会让第3条拿到第4条的译文）
+        keys = sorted(results)
+        if keys and keys == list(range(1, expected_count + 1)):
+            return [results[i] for i in keys if results[i]]
         # 兼容旧的按行解析（无"译文"标签、单行"编号. 内容"）
         results_old = []
         for line in lines:
@@ -3757,18 +4905,21 @@ class TranslatorApp:
                 else:
                     results_old.append(content)
         valid_old = [r for r in results_old if r is not None]
-        if len(valid_old) == expected_count:
-            return valid_old
+        # 只有编号连续无缺口时才能按编号对应（有缺口时按序返回会错位）
+        if len(results_old) == expected_count and all(r is not None for r in results_old):
+            return results_old
         # 按行解析失败，尝试按空行分隔（无编号的情况）
         if len(valid_old) == 0:
             blocks_plain = re.split(r'\n\s*\n', text.strip())
             blocks_plain = [b.strip() for b in blocks_plain if b.strip()]
             if len(blocks_plain) == expected_count:
                 return blocks_plain
-        # 编号不连续但数量够，尝试按出现顺序返回
-        if len(valid) >= expected_count:
+        # 数量多于预期时按出现顺序截断（要求前N个编号恰好是1..N，防错位）
+        valid = [results[i] for i in keys if results[i]]
+        if len(valid) > expected_count and keys[:expected_count] == list(range(1, expected_count + 1)):
             return valid[:expected_count]
-        if len(valid_old) >= expected_count:
+        if len(valid_old) > expected_count and all(r is not None for r in results_old[:expected_count]) \
+                and len(results_old) >= expected_count:
             return valid_old[:expected_count]
         return None
 
@@ -3866,19 +5017,22 @@ class TranslatorApp:
             translator = self._get_translator()
             engine_name = self.api_engine.get()
             workers = self.max_workers.get()
-            # DeepSeek 缓存构建是 best-effort 且需要一定时间；过高并发会同时制造多个首请求。
-            # 这里仅对明确识别为 DeepSeek 的 OpenAI-compatible 配置做缓存友好限并发。
-            if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+            # DeepSeek/TokenHub 缓存构建是 best-effort 且需要一定时间；过高并发会同时制造多个首请求。
+            if isinstance(translator, OpenAICompatTranslator) and (translator._is_deepseek() or translator._is_tokenhub()):
                 requested_workers = workers
                 workers = min(max(1, workers), 4)
                 if requested_workers != workers:
-                    self._log(f"DeepSeek缓存优化：并发 {requested_workers} → {workers}，减少冷前缀同时构建")
+                    self._log(f"Prompt缓存优化：并发 {requested_workers} → {workers}，减少冷前缀同时构建")
 
         # 整个翻译任务固定同一份术语表，预热必须使用与正式请求完全一致的前缀。
         if hasattr(translator, '_glossary') is False:
             translator._glossary = self._glossary_text
         self._active_cache_translators = [translator] if isinstance(translator, OpenAICompatTranslator) else []
-        if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+        # 门控必须覆盖 TokenHub：_cache_body_fields()/_cache_headers() 是以 _is_tokenhub() 为条件发送
+        # prompt_cache_key / X-Session-ID 的，若这里只判 _is_deepseek()，
+        # TokenHub 上配 qwen/GLM 等非 deepseek 模型时 identity 永远是 None，两个字段都发不出去，
+        # 请求无法路由到同一推理实例，KV Cache 完全无法复用。
+        if isinstance(translator, OpenAICompatTranslator) and (translator._is_deepseek() or translator._is_tokenhub()):
             try:
                 import hashlib as _hashlib
                 task_material = "|".join([
@@ -3887,17 +5041,19 @@ class TranslatorApp:
                 ])
                 task_key = "mtool-" + _hashlib.sha256(task_material.encode("utf-8")).hexdigest()[:32]
                 translator.set_cache_identity(task_key)
-                self._log(f"DeepSeek缓存身份：{"TokenHub" if translator._is_tokenhub() else "DeepSeek"} / key={task_key[:18]}…")
+                _vendor = "TokenHub" if translator._is_tokenhub() else "DeepSeek"
+                self._log(f"Prompt缓存身份：{_vendor} / key={task_key[:18]}…")
             except Exception as _e:
                 self._log(f"⚠ 设置Prompt Cache身份失败：{_e}")
             try:
+                _vendor = "TokenHub" if translator._is_tokenhub() else "DeepSeek"
                 self.cache_warmup_var.set("预热：正在自动建立固定前缀缓存…")
                 ok, msg = translator.warmup_cache(src, tgt)
                 self.cache_warmup_var.set(("预热：成功 · " if ok else "预热：失败 · ") + msg)
-                self._log(("✅ " if ok else "⚠ ") + "DeepSeek自动缓存预热：" + msg)
+                self._log(("✅ " if ok else "⚠ ") + f"{_vendor}自动缓存预热：" + msg)
             except Exception as e:
                 self.cache_warmup_var.set(f"预热：失败 · {str(e)[:120]}")
-                self._log(f"⚠ DeepSeek自动缓存预热异常：{e}")
+                self._log(f"⚠ 自动缓存预热异常：{e}")
 
         # Ollama本地模型预热：提前加载模型到内存，避免第一条翻译因加载超时
         if engine_name == "Ollama本地模型" and hasattr(translator, 'warmup'):
@@ -3978,6 +5134,9 @@ class TranslatorApp:
                 time.sleep(30)
                 if not self.is_running or self.should_stop:
                     break
+                # 失败流转阶段：30s限流等待+低并发重试是预期行为，不打"60秒无新进度"
+                if getattr(self, '_in_retry_phase', False):
+                    continue
                 elapsed_since_progress = time.time() - last_progress_time[0]
                 if elapsed_since_progress > 60 and last_done[0] > 0:
                     # 按实际翻译引擎判断，本地模型不说API限流
@@ -4043,6 +5202,15 @@ class TranslatorApp:
         # 失败流转：因限流/超时失败的条目，改用2线程低并发重试（快车不受慢车拖累）
         failed = [text for text in to_translate if text not in self.translated]
         if failed and not self.should_stop:
+            # 明确告诉用户：主翻译已完成，进入失败流转（避免误以为"翻译完了没自动暂停"）
+            self._in_retry_phase = True
+            success_count = len(to_translate) - len(failed)
+            self._log(f"✅ 主翻译阶段完成：{success_count}/{len(to_translate)} 条成功，{len(failed)} 条失败进入低并发重试...")
+            self.root.after(0, lambda s=success_count, f=len(failed), t=len(to_translate): (
+                self.status_label.config(
+                    text=f"主翻译完成({s}/{t}) - 失败流转中：{f} 条等待重试（限流等待30s+重试）"),
+                self.cache_status_var.set(f"状态：失败流转中 · {f} 条等待重试")
+            ))
             # 过滤出真正值得重试的（路径/编号标签等跳过项直接保留原文，不浪费本地模型资源）
             skippable = [text for text in failed if self._should_skip_translation(text)]
             if skippable:
@@ -4100,6 +5268,9 @@ class TranslatorApp:
                 self._save_progress()
                 retry_success = sum(1 for text in failed if text in self.translated)
                 self._log(f"【失败流转】重试完成：{retry_success}/{len(failed)} 条成功，{len(failed)-retry_success} 条仍失败")
+                self._in_retry_phase = False
+                self.root.after(0, lambda rs=retry_success, f=len(failed):
+                    self.status_label.config(text=f"失败流转完成：{rs}/{f} 条重试成功"))
 
         self._save_output(data)
 
@@ -4161,14 +5332,16 @@ class TranslatorApp:
         except Exception as _e:
             self._log(f"⚠ 双引擎设置Prompt Cache身份失败：{_e}")
         for label, translator in (("A", translator_a), ("B", translator_b)):
-            if isinstance(translator, OpenAICompatTranslator) and translator._is_deepseek():
+            if isinstance(translator, OpenAICompatTranslator) and (translator._is_deepseek() or translator._is_tokenhub()):
                 try:
+                    _vendor = "TokenHub" if translator._is_tokenhub() else "DeepSeek"
                     self.cache_warmup_var.set(f"预热：正在预热引擎{label}…")
                     ok, msg = translator.warmup_cache(src, tgt)
-                    self._log(("✅ " if ok else "⚠ ") + f"DeepSeek引擎{label}自动缓存预热：" + msg)
+                    self._log(("✅ " if ok else "⚠ ") + f"{_vendor}引擎{label}自动缓存预热：" + msg)
                 except Exception as e:
-                    self._log(f"⚠ DeepSeek引擎{label}自动缓存预热异常：{e}")
-        if any(isinstance(t, OpenAICompatTranslator) and t._is_deepseek() for t in self._active_cache_translators):
+                    self._log(f"⚠ 引擎{label}自动缓存预热异常：{e}")
+        if any(isinstance(t, OpenAICompatTranslator) and (t._is_deepseek() or t._is_tokenhub())
+               for t in self._active_cache_translators):
             self.cache_warmup_var.set("预热：自动预热已执行")
 
         workers_a = self.max_workers.get()
@@ -4233,6 +5406,9 @@ class TranslatorApp:
                 time.sleep(30)
                 if not self.is_running or self.should_stop:
                     break
+                # 失败流转阶段不触发"60秒无新进度"提示
+                if getattr(self, '_in_retry_phase', False):
+                    continue
                 elapsed = time.time() - last_progress_time[0]
                 if elapsed > 60 and last_done[0] > 0:
                     # 判断是否本地模型，本地模型不说API限流
@@ -4332,6 +5508,15 @@ class TranslatorApp:
         # 失败流转：任一引擎失败的条目，用主引擎低并发重试
         failed = [text for text in to_translate if text not in self.translated]
         if failed and not self.should_stop:
+            # 明确告诉用户：主翻译已完成，进入失败流转
+            self._in_retry_phase = True
+            success_count = len(to_translate) - len(failed)
+            self._log(f"✅ 主翻译阶段完成：{success_count}/{len(to_translate)} 条成功，{len(failed)} 条失败进入低并发重试...")
+            self.root.after(0, lambda s=success_count, f=len(failed), t=len(to_translate): (
+                self.status_label.config(
+                    text=f"主翻译完成({s}/{t}) - 失败流转中：{f} 条等待重试（限流等待30s+重试）"),
+                self.cache_status_var.set(f"状态：失败流转中 · {f} 条等待重试")
+            ))
             # 按实际主引擎判断是否本地模型（Ollama），本地模型无限流，不需要等待
             is_local = getattr(translator_a, 'name', '') == 'Ollama本地模型'
             if is_local:
@@ -4363,6 +5548,9 @@ class TranslatorApp:
                 self._save_progress()
                 retry_success = sum(1 for text in failed if text in self.translated)
                 self._log(f"【失败流转】重试完成：{retry_success}/{len(failed)} 条成功")
+                self._in_retry_phase = False
+                self.root.after(0, lambda rs=retry_success, f=len(failed):
+                    self.status_label.config(text=f"失败流转完成：{rs}/{f} 条重试成功"))
 
         self._save_output(data)
 
@@ -4951,7 +6139,7 @@ class TranslatorApp:
                     self.root.after(0, _done)
                 except Exception as e:
                     self._log(f"翻译校准→LLM精修失败: {e}")
-                    def _err():
+                    def _err(e=e):
                         try:
                             if dlg.winfo_exists():
                                 messagebox.showerror("错误", f"精修失败：{e}", parent=dlg)
@@ -5241,8 +6429,9 @@ class TranslatorApp:
         m = re.match(r'^(?:编号|序号)[：:]\s*\d+\s*[\.、\)）]?\s*', t)
         if m:
             t = t[m.end():].strip()
-        # 剥离编号残留（如 "1. " / "1、" / "1)"）
-        m = re.match(r'^\d+\s*[\.、\)）]\s*', t)
+        # 剥离编号残留（如 "1. 译文" / "1、 译文"）。分隔符后必须跟空白——
+        # 否则会把合法译文剥坏（"1.5倍伤害"→"5倍伤害"、"3、石榴"→"石榴"）
+        m = re.match(r'^\d{1,3}\s*[\.、\)）]\s+', t)
         if m:
             t = t[m.end():].strip()
         # 再剥离一次标签前缀（模型可能在编号后再输出"精修后译文："等）
@@ -5353,10 +6542,15 @@ class TranslatorApp:
             refine_recorder = None
             if not is_local:
                 try:
-                    refine_recorder = OpenAICompatTranslator(api_key=api_key, model=model, base_url=base_url)
+                    refine_recorder = OpenAICompatTranslator(
+                        api_key=api_key, model=model, base_url=base_url,
+                        disable_thinking=self.disable_thinking.get())
                     self._active_cache_translators.append(refine_recorder)
                 except Exception:
                     refine_recorder = None
+            # 精修同样关闭思考模式（翻译/润色都是直译任务，不需要CoT）
+            no_think_fields = (build_no_think_fields(model, base_url)
+                               if self.disable_thinking.get() else {})
             prompt_template = self.refine_prompt.get()
             # 系统提示：动态插入语言名称
             system_prompt = f"{prompt_template}\n源语言：{src_name}，目标语言：{tgt_name}。"
@@ -5381,10 +6575,12 @@ class TranslatorApp:
                             messages.append({"role": "user", "content": f"原文：{orig}\n初译：（已精修，作为术语参考）"})
                             messages.append({"role": "assistant", "content": ref})
                         messages.append({"role": "user", "content": f"原文：{key}\n初译：{initial_trans}\n请输出精修后的译文："})
-                        payload = json.dumps({
+                        _body = {
                             "model": model, "messages": messages,
                             "temperature": 0.3, "max_tokens": 2048,
-                        }).encode('utf-8')
+                        }
+                        _body.update(no_think_fields)
+                        payload = json.dumps(_body).encode('utf-8')
                         result = pool_request('POST', refine_url, body=payload, headers={
                             'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}',
                         }, timeout=120)
@@ -5437,10 +6633,12 @@ class TranslatorApp:
                             user_content += f"{i+1}. 原文：{key}\n初译：{initial}\n\n"
                         user_content += "请按编号输出精修后的译文，每条一行，格式：编号. 译文"
                         messages.append({"role": "user", "content": user_content})
-                        payload = json.dumps({
+                        _body = {
                             "model": model, "messages": messages,
                             "temperature": 0.3, "max_tokens": 4096,
-                        }).encode('utf-8')
+                        }
+                        _body.update(no_think_fields)
+                        payload = json.dumps(_body).encode('utf-8')
                         result = pool_request('POST', refine_url, body=payload, headers={
                             'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}',
                         }, timeout=120)
@@ -5578,7 +6776,8 @@ class TranslatorApp:
         self._log("正在停止...")
 
     def _deepseek_offpeak(self, now=None):
-        """DeepSeek官方错峰时段判断：北京时间 00:30–08:30 为空闲时段，其余为高峰。
+        """DeepSeek官方错峰时段判断（2026-09 核对官方页面）：高峰 = 工作日（周一至周五）
+        北京时间 09:00–12:00 与 14:00–18:00，其余时段半价。
         返回 (is_peak, now)。
         """
         if now is None:
@@ -5588,14 +6787,18 @@ class TranslatorApp:
             now = now.astimezone(ZoneInfo('Asia/Shanghai'))
         except Exception:
             pass
+        weekday = now.weekday()  # 0=周一
         minutes = now.hour * 60 + now.minute
-        is_peak = not (30 <= minutes < 8 * 60 + 30)  # 00:30 <= t < 08:30 为空闲
+        in_morning = 9 * 60 <= minutes < 12 * 60      # 09:00–12:00
+        in_afternoon = 14 * 60 <= minutes < 18 * 60   # 14:00–18:00
+        is_peak = (weekday < 5) and (in_morning or in_afternoon)
+        # 其余（晚间/深夜/清晨/周末）均为半价时段
         return is_peak, now
 
     def _deepseek_cache_cost(self, stats, model_name=None):
         """根据当前DeepSeek官方V4价格估算本轮真实API费用（人民币）。
         未知模型不猜价格，只返回可显示的token统计。峰谷时间按北京时间判断
-        （官方错峰时段：00:30–08:30 空闲约半价，其余高峰全价）。
+        （官方错峰：工作日 09:00–12:00、14:00–18:00 为高峰全价，其余时段半价）。
         """
         if not stats:
             return None
@@ -5950,6 +7153,7 @@ class TranslatorApp:
             _safe(self.chunk_size, cfg.get("chunk_size", 1500))
             _safe(self.batch_size, cfg.get("batch_size", 5))
             _safe(self.protect_placeholders, cfg.get("protect_placeholders", True))
+            _safe(self.disable_thinking, cfg.get("disable_thinking", True))
             # 占位符保护规则：旧默认值自动升级为新版（增加 [name] / \V[n] / %name% 等游戏引擎变量）
             _OLD_PROTECT = r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>"
             _NEW_PROTECT = r"\{[^}]+\}|%[sdif]|\$[a-zA-Z_][a-zA-Z0-9_]*|<[^>]+>|\[[a-zA-Z_][a-zA-Z0-9_]*\]|\\[VvNnIiCc]\s*\[\d+\]|%[a-zA-Z_][a-zA-Z0-9_]*%|\[\[[^\]]+\]\]"
@@ -6050,6 +7254,7 @@ class TranslatorApp:
                 "chunk_size": self.chunk_size.get(),
                 "batch_size": self.batch_size.get(),
                 "protect_placeholders": self.protect_placeholders.get(),
+                "disable_thinking": self.disable_thinking.get(),
                 "protect_patterns": self.protect_patterns.get(),
                 "dark_mode": self.dark_mode.get(),
                 "webhook_url": self.webhook_url.get(),
@@ -6536,7 +7741,7 @@ class {name.title().replace('_', '')}Translator:
                 release_notes = data.get('body', '')
                 self.root.after(0, lambda: self._show_update_dialog(latest, html_url, release_notes))
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("检查失败", f"无法连接到GitHub检查更新：\n{e}"))
+                self.root.after(0, lambda e=e: messagebox.showerror("检查失败", f"无法连接到GitHub检查更新：\n{e}"))
         threading.Thread(target=_do_check, daemon=True).start()
 
     def _show_update_dialog(self, latest, html_url, release_notes):
@@ -6662,6 +7867,113 @@ def _show_startup_update_dialog(root, latest, html_url, release_notes):
     ttk.Button(btn_frame, text="稍后再说", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
 
 
+def _parse_startup_args(argv=None):
+    """解析启动参数 --game <目录> / --file <文件>（供 GUI 控制台调用），返回 (game_dir, file_arg)"""
+    if argv is None:
+        argv = sys.argv[1:]
+    game_dir = None
+    file_arg = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--game' and i + 1 < len(argv):
+            game_dir = argv[i + 1]
+            i += 2
+        elif a.startswith('--game='):
+            game_dir = a.split('=', 1)[1]
+            i += 1
+        elif a == '--file' and i + 1 < len(argv):
+            file_arg = argv[i + 1]
+            i += 2
+        elif a.startswith('--file='):
+            file_arg = a.split('=', 1)[1]
+            i += 1
+        else:
+            i += 1
+    return game_dir, file_arg
+
+
+def _locate_game_text_json(game_dir):
+    """在游戏目录中定位文本JSON：优先根目录 ManualTransFile.json，其次递归找 *TransFile*.json"""
+    game_dir = (game_dir or '').strip().strip('"')
+    if not game_dir or not os.path.isdir(game_dir):
+        return None
+    cand = os.path.join(game_dir, 'ManualTransFile.json')
+    if os.path.isfile(cand):
+        return cand
+    hits = []
+    for base, _dirs, files in os.walk(game_dir):
+        for fn in files:
+            low = fn.lower()
+            if low == 'manualtransfile.json' or (low.endswith('.json') and 'transfile' in low):
+                hits.append(os.path.join(base, fn))
+        if len(hits) > 64:
+            break
+    if hits:
+        # 多个候选时优先根目录下、其次取体积最大的（主文本文件通常最大）
+        hits.sort(key=lambda p: (os.path.dirname(p) == game_dir, os.path.getsize(p)), reverse=True)
+        return hits[0]
+    return None
+
+
+def _apply_startup_args(app):
+    """应用 --game/--file 启动参数：自动填入文本JSON（行为与拖入文件一致，不自动调用AI翻译）"""
+    game_dir, file_arg = _parse_startup_args()
+    target = file_arg
+    if not target and game_dir:
+        target = _locate_game_text_json(game_dir)
+        if not target:
+            try:
+                app._log(f"--game 目录中未找到 ManualTransFile.json：{game_dir}，请手动选择文本JSON")
+            except Exception:
+                pass
+    if target and os.path.isfile(target):
+        app.input_file.set(target)
+        try:
+            app._glossary_reload_ui()
+            app._glossary_auto_prepare()
+        except Exception:
+            pass
+        d = os.path.dirname(target)
+        if not app.output_file.get() or os.path.basename(app.output_file.get()) == "ManualTransFile.json":
+            app.output_file.set(os.path.join(d, "ManualTransFile.json"))
+        if not app.progress_file.get() or os.path.basename(app.progress_file.get()) == "trans_progress.json":
+            app.progress_file.set(os.path.join(d, "trans_progress.json"))
+        try:
+            app._log(f"已从启动参数载入: {target}")
+        except Exception:
+            pass
+
+
+def _apply_config_json(app):
+    """读取脚本同级目录 config.json（GUI 控制台写入），覆盖对应设置。
+    仅覆盖非空值；ollama_url 仅在当前引擎为 Ollama 系时生效。"""
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if not os.path.isfile(cfg_path):
+        return
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+    try:
+        api_key = str(cfg.get("api_key") or "").strip()
+        if api_key:
+            app.api_key.set(api_key)
+        concurrency = cfg.get("concurrency")
+        if isinstance(concurrency, (int, float)) and int(concurrency) > 0:
+            app.max_workers.set(int(concurrency))
+        ollama_url = str(cfg.get("ollama_url") or "").strip()
+        if ollama_url and "ollama" in app.api_engine.get().lower():
+            app.base_url.set(ollama_url.rstrip('/'))
+        timeout = cfg.get("timeout")
+        if isinstance(timeout, (int, float)) and int(timeout) > 0:
+            app._gui_timeout = int(timeout)
+        app._log("已从 config.json 应用控制台配置")
+    except Exception:
+        pass
+
+
 def main():
     # 尝试启用拖拽支持
     try:
@@ -6693,6 +8005,16 @@ def main():
         return
     if dnd_available:
         app._setup_dnd()
+    # 应用 --game/--file 启动参数（GUI 控制台传入游戏目录时自动定位文本JSON）
+    try:
+        _apply_startup_args(app)
+    except Exception:
+        pass
+    # 应用 config.json 控制台配置（API密钥/并发/Ollama地址/超时）
+    try:
+        _apply_config_json(app)
+    except Exception:
+        pass
     # Tk回调异常记录：pythonw下没有控制台，回调里报错会被静默吞掉，
     # 全部写进 ui_callback_errors.txt 便于排查"翻译完成后没反应"这类问题
     def _report_callback_exception(exc_type, exc_value, exc_tb):
