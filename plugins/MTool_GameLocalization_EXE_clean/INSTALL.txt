@@ -1,0 +1,17 @@
+【MTool 万能游戏本地化 - UnityPy / AssetRipper 兼容版】
+
+安装：把本目录内的文件和文件夹直接复制到 MTool\\plugins\\ 根目录，不要再套一层子目录。
+
+plugins\\
+  MTool_万能游戏本地化_UnityPy_AssetRipper.py
+  xp3_adapter.py
+  _SExtractorRuntime\\
+
+启动 MTool 后：工具 → 万能游戏本地化（SExtractor原生）。
+
+Unity 后端：
+  1. UnityPy：主后端，可选安装；插件载入不依赖 UnityPy。
+  2. AssetRipper：可选兜底；通过“选择 AssetRipper”配置，可执行文件路径会自动保存。
+  3. 两者都不可用时，自动模式退回传统扫描，不会导致插件加载失败。
+
+AssetRipper 不要求必须安装。建议需要深度 Unity 解析时再配置。

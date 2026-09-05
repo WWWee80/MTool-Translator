@@ -15,5 +15,4 @@ class ExampleTranslator:
         self.timeout = timeout
 
     def translate(self, text, source_lang, target_lang):
-        # 在这里实现你的翻译逻辑
         return text
