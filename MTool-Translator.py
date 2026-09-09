@@ -26,7 +26,7 @@ import random
 import tkinter as tk
 
 # ==================== 版本与更新 ====================
-VERSION = "1.1.10"
+VERSION = "1.2.1"
 # GitHub 仓库地址（推送到 GitHub 后改成你的 用户名/仓库名）
 GITHUB_REPO = "WWWee80/MTool-Translator"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -1726,6 +1726,10 @@ GLOSSARY_LLM_PRESETS["LM Studio本地"] = {
     "hint": "LM Studio 本地（免费离线）。加载模型后点「获取模型」自动列出；Key 填任意非空字符串",
 }
 
+# 每次LLM请求都会携带的固定前缀token估算值（system提示+批量指令，64对齐后实测约448）。
+# 批量翻译时这部分每次请求都重发，是输入token的大头，费用预估必须计入。
+EST_PREFIX_TOKENS = 448
+
 # 费用预估费率（每百万字符，人民币；免费额度内不计费）
 COST_RATES = {
     "谷歌翻译(免费)": {"type": "free", "note": "完全免费"},
@@ -1778,9 +1782,11 @@ MODEL_PRICES = {
     "MiniMaxAI/MiniMax-M2.5": 8.4,
     "nex-agi/Nex-N2-Pro": 7.0,
     "moonshotai/Kimi-K2.7-Code": 27.0,
-    # ===== DeepSeek官方（V4 输出价，deepseek-chat/reasoner 已于 2026-07-24 下线）=====
-    "deepseek-v4-flash": 9.0,
-    "deepseek-v4-pro": 27.0,
+    # ===== DeepSeek官方（V4 峰谷计价，2026-09核对官方页面：下表为【空闲时段输出价】，
+    #       工作日9-12/14-18点为高峰全价×2；费用预估对V4模型单独按峰谷+缓存命中精算。
+    #       deepseek-chat/reasoner 已于 2026-07-24 下线）=====
+    "deepseek-v4-flash": 4.5,
+    "deepseek-v4-pro": 13.5,
     # ===== 豆包 =====
     "doubao-1-5-lite-32k-250115": 0.3,
     "doubao-1-5-pro-32k-250115": 2.0,
@@ -3832,19 +3838,23 @@ class TranslatorApp:
         if not inf or not os.path.exists(inf):
             messagebox.showwarning("提示", "请先选择输入文件")
             return
-        try:
-            with open(inf, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            messagebox.showerror("错误", f"读取JSON失败：{e}")
-            return
         src = self._get_lang_code(self.source_lang.get())
         tgt = self._get_lang_code(self.target_lang.get())
         if tgt == "auto":
             tgt = "zh-CN"
 
-        # 后台线程执行扫描
+        # 后台线程执行读取+扫描，避免大JSON卡住UI
         def _scan_worker():
+            try:
+                with open(inf, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception as e:
+                self.root.after(0, lambda: (messagebox.showerror("错误", f"读取JSON失败：{e}"),
+                                            self.status_label.config(text="检测失败：读取JSON出错")))
+                return
+            _scan(data)
+
+        def _scan(data):
             issues = []  # [(原文, 译文, 问题描述, 质量分)]
             total = len(data)
             checked = 0
@@ -3922,8 +3932,16 @@ class TranslatorApp:
             # 扫描完成，回到主线程显示结果
             self.root.after(0, lambda: self._on_detect_complete(issues, data, inf))
 
+        def _scan_safe():
+            # 任何后台异常都要回报到主线程，避免静默失败、状态栏永远卡在"正在检测"
+            try:
+                _scan_worker()
+            except Exception as e:
+                self.root.after(0, lambda: (messagebox.showerror("错误", f"检测过程出错：{e}"),
+                                            self.status_label.config(text="检测失败")))
+
         self.status_label.config(text="正在检测翻译不全，请稍候...")
-        threading.Thread(target=_scan_worker, daemon=True).start()
+        threading.Thread(target=_scan_safe, daemon=True).start()
 
     def _on_detect_complete(self, issues, data, inf):
         """检测完成回调（主线程）"""
@@ -3938,55 +3956,70 @@ class TranslatorApp:
         """显示翻译不全条目检测结果对话框，支持勾选后清空译文重新翻译"""
         dlg = tk.Toplevel(self.root)
         dlg.title(f"检测到 {len(issues)} 条翻译不全")
-        dlg.geometry("900x600")
+        dlg.geometry("1000x620")
         dlg.transient(self.root)
-        dlg.grab_set()
+        checked = set()  # 已勾选的条目索引（默认全选）
+
         # 说明
-        ttk.Label(dlg, text=f"共检测到 {len(issues)} 条可能翻译不全的条目。勾选后可清空译文，重新翻译。",
+        ttk.Label(dlg, text=f"共检测到 {len(issues)} 条可能翻译不全的条目。点击行首方框列切换勾选，勾选后可清空译文重新翻译或送LLM精修。",
                   font=("微软雅黑", 10)).pack(anchor=tk.W, padx=10, pady=(10, 5))
-        # 列表区（带滚动条）
+        # 列表区：Treeview 单控件承载全部行，大量条目时也不会卡UI
         list_frame = ttk.Frame(dlg)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        canvas = tk.Canvas(list_frame)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        # 全选变量
-        select_all_var = tk.BooleanVar(value=True)
-        check_vars = []
-        # 表头
-        header = ttk.Frame(scroll_frame)
-        header.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Checkbutton(header, variable=select_all_var,
-                       command=lambda: [v.set(select_all_var.get()) for v in check_vars]).pack(side=tk.LEFT)
-        ttk.Label(header, text="原文（前80字）", width=40, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text="译文（前80字）", width=40, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text="问题", width=30, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, pady=2)
+        columns = ("sel", "src", "tgt", "reason")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="none")
+        tree.heading("sel", text="全选")
+        tree.heading("src", text="原文（前80字）")
+        tree.heading("tgt", text="译文（前80字）")
+        tree.heading("reason", text="问题")
+        tree.column("sel", width=45, stretch=False, anchor="center")
+        tree.column("src", width=350, anchor="w")
+        tree.column("tgt", width=350, anchor="w")
+        tree.column("reason", width=210, anchor="w")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
         # 填充条目
-        for source, target, reason, q in issues:
-            row = ttk.Frame(scroll_frame)
-            row.pack(fill=tk.X, padx=5, pady=1)
-            var = tk.BooleanVar(value=True)
-            check_vars.append(var)
-            ttk.Checkbutton(row, variable=var).pack(side=tk.LEFT)
+        for idx, (source, target, reason, q) in enumerate(issues):
             src_display = source.replace('\n', '\\n')[:80]
             tgt_display = target.replace('\n', '\\n')[:80]
-            ttk.Label(row, text=src_display, width=40, anchor="w",
-                     font=("微软雅黑", 8), foreground="#333").pack(side=tk.LEFT, padx=5)
-            ttk.Label(row, text=tgt_display, width=40, anchor="w",
-                     font=("微软雅黑", 8), foreground="#666").pack(side=tk.LEFT, padx=5)
-            ttk.Label(row, text=reason, width=30, anchor="w",
-                     font=("微软雅黑", 8), foreground="#d32f2f", wraplength=200).pack(side=tk.LEFT, padx=5)
+            tree.insert("", "end", iid=str(idx),
+                        values=("☑", src_display, tgt_display, f"{reason}（质量{q}分）"))
+            checked.add(idx)
+
+        def _toggle(idx):
+            if idx in checked:
+                checked.discard(idx)
+                tree.set(str(idx), "sel", "☐")
+            else:
+                checked.add(idx)
+                tree.set(str(idx), "sel", "☑")
+
+        def _on_click(event):
+            region = tree.identify("region", event.x, event.y)
+            if region == "cell":
+                col = tree.identify_column(event.x)
+                iid = tree.identify_row(event.y)
+                if iid and col == "#1":
+                    _toggle(int(iid))
+            elif region == "heading" and tree.identify_column(event.x) == "#1":
+                # 点击表头"全选"：全选/全不选切换
+                if len(checked) == len(issues):
+                    checked.clear()
+                    for i in range(len(issues)):
+                        tree.set(str(i), "sel", "☐")
+                else:
+                    checked.update(range(len(issues)))
+                    for i in range(len(issues)):
+                        tree.set(str(i), "sel", "☑")
+
+        tree.bind("<Button-1>", _on_click)
         # 底部按钮
         btn_frame = ttk.Frame(dlg)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         def _clear_selected():
-            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            selected = sorted(checked)
             if not selected:
                 messagebox.showinfo("提示", "请先勾选要重新翻译的条目", parent=dlg)
                 return
@@ -4014,7 +4047,7 @@ class TranslatorApp:
                 messagebox.showerror("错误", f"保存失败：{e}", parent=dlg)
         def _llm_refine_selected():
             """把选中的校准检出条目直接送LLM精修（机翻→校准→LLM工作流）"""
-            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            selected = sorted(checked)
             if not selected:
                 messagebox.showinfo("提示", "请先勾选要精修的条目", parent=dlg)
                 return
@@ -4076,11 +4109,37 @@ class TranslatorApp:
                             pass
                     self.root.after(0, _err)
             threading.Thread(target=_worker, daemon=True).start()
-        ttk.Button(btn_frame, text="全选", command=lambda: [v.set(True) for v in check_vars]).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="全不选", command=lambda: [v.set(False) for v in check_vars]).pack(side=tk.LEFT, padx=5)
+        def _select_all():
+            checked.update(range(len(issues)))
+            for i in range(len(issues)):
+                tree.set(str(i), "sel", "☑")
+
+        def _select_none():
+            checked.clear()
+            for i in range(len(issues)):
+                tree.set(str(i), "sel", "☐")
+
+        ttk.Button(btn_frame, text="全选", command=_select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="全不选", command=_select_none).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="送LLM精修选中条目", command=_llm_refine_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="清空选中译文并重新翻译", command=_clear_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+
+        # 关键修复：先让窗口显示、置顶并获得焦点，之后才 grab_set。
+        # 旧代码在窗口映射前就 grab_set，Windows 上窗口可能藏在主窗口后面：
+        # 全局 grab 把所有事件重定向到看不见的对话框 → 主窗口点不了也关不掉（只剩拖动能动）。
+        def _post_show():
+            try:
+                dlg.lift()
+                dlg.focus_force()
+                dlg.attributes("-topmost", True)
+                dlg.after(200, lambda: dlg.attributes("-topmost", False))
+                dlg.wait_visibility()
+                dlg.grab_set()
+            except Exception:
+                pass  # 窗口可能已被用户关闭
+
+        dlg.after(50, _post_show)
 
     def _show_stats(self):
         inf = self.input_file.get()
@@ -4806,7 +4865,7 @@ class TranslatorApp:
             self._log(f"单引擎: {self.api_engine.get()}, 方向: {src}->{tgt}, 并发: {self.max_workers.get()}")
 
         # 费用预估
-        cost_info = self._estimate_cost(self.total_chars)
+        cost_info = self._estimate_cost(self.total_chars, len(self.to_translate), verbose=True)
         if cost_info:
             self._log(f"费用预估: {cost_info}")
         if use_engine_b:
@@ -6012,55 +6071,69 @@ class TranslatorApp:
         """显示语义校验检出的术语错误条目对话框，支持勾选后清空译文重新翻译 或 直接送LLM精修"""
         dlg = tk.Toplevel(self.root)
         dlg.title(f"翻译校准：检出 {len(issues)} 条可能术语错误")
-        dlg.geometry("900x600")
+        dlg.geometry("1000x620")
         dlg.transient(self.root)
-        dlg.grab_set()
+        checked = set()  # 已勾选的条目索引（默认全选）
         ttk.Label(dlg, text=f"共检出 {len(issues)} 条语义相似度低于阈值的条目，可能是术语翻译错误（如神殿→寺庙）。\n勾选后可「送LLM精修」直接修正，或「清空重翻」交给机翻重跑。",
                   font=("微软雅黑", 10), wraplength=850).pack(anchor=tk.W, padx=10, pady=(10, 5))
-        # 列表区
+        # 列表区：Treeview 单控件承载全部行，大量条目时也不会卡UI
         list_frame = ttk.Frame(dlg)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        canvas = tk.Canvas(list_frame)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        select_all_var = tk.BooleanVar(value=True)
-        check_vars = []
-        # 表头
-        header = ttk.Frame(scroll_frame)
-        header.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Checkbutton(header, variable=select_all_var,
-                       command=lambda: [v.set(select_all_var.get()) for v in check_vars]).pack(side=tk.LEFT)
-        ttk.Label(header, text="原文（前60字）", width=35, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text="译文（前60字）", width=35, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Label(header, text="相似度", width=10, font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=5)
-        ttk.Separator(scroll_frame, orient="horizontal").pack(fill=tk.X, pady=2)
+        columns = ("sel", "src", "tgt", "sim")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="none")
+        tree.heading("sel", text="全选")
+        tree.heading("src", text="原文（前60字）")
+        tree.heading("tgt", text="译文（前60字）")
+        tree.heading("sim", text="相似度")
+        tree.column("sel", width=45, stretch=False, anchor="center")
+        tree.column("src", width=380, anchor="w")
+        tree.column("tgt", width=380, anchor="w")
+        tree.column("sim", width=150, anchor="w")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
         # 按相似度从低到高排序（最可疑的排前面）
         issues_sorted = sorted(issues, key=lambda x: x[2])
-        for source, target, sim in issues_sorted:
-            row = ttk.Frame(scroll_frame)
-            row.pack(fill=tk.X, padx=5, pady=1)
-            var = tk.BooleanVar(value=True)
-            check_vars.append(var)
-            ttk.Checkbutton(row, variable=var).pack(side=tk.LEFT)
+        for idx, (source, target, sim) in enumerate(issues_sorted):
             src_display = source.replace('\n', '\\n')[:60]
             tgt_display = target.replace('\n', '\\n')[:60]
-            ttk.Label(row, text=src_display, width=35, anchor="w",
-                     font=("微软雅黑", 8), foreground="#333").pack(side=tk.LEFT, padx=5)
-            ttk.Label(row, text=tgt_display, width=35, anchor="w",
-                     font=("微软雅黑", 8), foreground="#d32f2f").pack(side=tk.LEFT, padx=5)
-            sim_color = "#d32f2f" if sim < 0.6 else "#ff9800" if sim < 0.7 else "#ffc107"
-            ttk.Label(row, text=f"{sim:.3f}", width=10, anchor="w",
-                     font=("微软雅黑", 8, "bold"), foreground=sim_color).pack(side=tk.LEFT, padx=5)
+            tree.insert("", "end", iid=str(idx),
+                        values=("☑", src_display, tgt_display, f"{sim:.3f}"))
+            checked.add(idx)
+
+        def _toggle(idx):
+            if idx in checked:
+                checked.discard(idx)
+                tree.set(str(idx), "sel", "☐")
+            else:
+                checked.add(idx)
+                tree.set(str(idx), "sel", "☑")
+
+        def _on_click(event):
+            region = tree.identify("region", event.x, event.y)
+            if region == "cell":
+                col = tree.identify_column(event.x)
+                iid = tree.identify_row(event.y)
+                if iid and col == "#1":
+                    _toggle(int(iid))
+            elif region == "heading" and tree.identify_column(event.x) == "#1":
+                # 点击表头"全选"：全选/全不选切换
+                if len(checked) == len(issues):
+                    checked.clear()
+                    for i in range(len(issues)):
+                        tree.set(str(i), "sel", "☐")
+                else:
+                    checked.update(range(len(issues)))
+                    for i in range(len(issues)):
+                        tree.set(str(i), "sel", "☑")
+
+        tree.bind("<Button-1>", _on_click)
         # 底部按钮
         btn_frame = ttk.Frame(dlg)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         def _clear_selected():
-            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            selected = sorted(checked)
             if not selected:
                 messagebox.showinfo("提示", "请先勾选要重新翻译的条目", parent=dlg)
                 return
@@ -6089,7 +6162,7 @@ class TranslatorApp:
                 messagebox.showerror("错误", f"保存失败：{e}", parent=dlg)
         def _llm_refine_selected():
             """把选中的校准检出条目直接送LLM精修（机翻→校准→LLM工作流）"""
-            selected = [i for i, v in enumerate(check_vars) if v.get()]
+            selected = sorted(checked)
             if not selected:
                 messagebox.showinfo("提示", "请先勾选要精修的条目", parent=dlg)
                 return
@@ -6147,11 +6220,36 @@ class TranslatorApp:
                             pass
                     self.root.after(0, _err)
             threading.Thread(target=_worker, daemon=True).start()
-        ttk.Button(btn_frame, text="全选", command=lambda: [v.set(True) for v in check_vars]).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="全不选", command=lambda: [v.set(False) for v in check_vars]).pack(side=tk.LEFT, padx=5)
+
+        def _select_all():
+            checked.update(range(len(issues)))
+            for i in range(len(issues)):
+                tree.set(str(i), "sel", "☑")
+
+        def _select_none():
+            checked.clear()
+            for i in range(len(issues)):
+                tree.set(str(i), "sel", "☐")
+
+        ttk.Button(btn_frame, text="全选", command=_select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="全不选", command=_select_none).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="送LLM精修选中条目", command=_llm_refine_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="清空选中译文并重新翻译", command=_clear_selected).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="关闭", command=dlg.destroy).pack(side=tk.RIGHT, padx=5)
+
+        # 关键修复：窗口显示、置顶后再 grab_set（同"检测翻译不全"对话框）
+        def _post_show():
+            try:
+                dlg.lift()
+                dlg.focus_force()
+                dlg.attributes("-topmost", True)
+                dlg.after(200, lambda: dlg.attributes("-topmost", False))
+                dlg.wait_visibility()
+                dlg.grab_set()
+            except Exception:
+                pass  # 窗口可能已被用户关闭
+
+        dlg.after(50, _post_show)
 
     def _assess_quality(self, source, target, src_lang, tgt_lang):
         """评估译文质量，返回0-100分数。低分表示需要精修。
@@ -6803,6 +6901,14 @@ class TranslatorApp:
         if not stats:
             return None
         model = (model_name or self.model.get() or '').lower()
+        # 仅DeepSeek官方（api.deepseek.com）有峰谷计价；中转站/硅基流动的
+        # deepseek-ai/*同名模型是平价计费，不能套官方价，宁可不报费用只报token。
+        try:
+            base_l = (self.base_url.get() or '').lower()
+        except Exception:
+            base_l = ''
+        if 'deepseek.com' not in base_l:
+            return None
         if 'deepseek-v4-flash' in model:
             hit_peak, miss_peak, out_peak = 0.10, 3.00, 9.00
         elif 'deepseek-v4-pro' in model:
@@ -6983,7 +7089,7 @@ class TranslatorApp:
             messagebox.showerror("错误", f"加载失败: {e}")
 
     # ==================== 费用预估 ====================
-    def _estimate_cost(self, chars):
+    def _estimate_cost(self, chars, entries=0, verbose=False):
         engine_name = self.api_engine.get()
         rate = COST_RATES.get(engine_name)
         if not rate:
@@ -6993,38 +7099,114 @@ class TranslatorApp:
 
         # 完全免费
         if cost_type == "free":
-            return f"免费（{note}）"
+            return f"免费（{note}）" if verbose else "免费"
 
         # 按字符计费
         if cost_type == "per_char":
             free = rate.get("free_chars", 0)
             per_million = rate.get("per_million", 0)
             if per_million == 0:
-                return f"免费额度内（{note}）"
+                return f"免费额度内（{note}）" if verbose else "免费"
             billable = max(0, chars - free)
             cost = billable / 1_000_000 * per_million
-            return f"约{cost:.2f}元（免费额度{free}字符，超出{per_million}元/百万字符，{note}）"
+            if verbose:
+                return f"约{cost:.2f}元（免费额度{free}字符，超出{per_million}元/百万字符，{note}）"
+            return f"约{cost:.2f}元"
 
         # 按token计费（LLM）
         if cost_type == "per_token":
-            # 估算token数：中文约1字符=1.2token，英文约4字符=1token
-            # 混合内容取保守值：字符数 × 0.9 ≈ 输入token；输出token≈输入token
-            input_tokens = int(chars * 0.9)
-            output_tokens = int(chars * 0.9)  # 译文长度近似
+            # 输入token：日文混合控制码/英文/占位符，实测约1.25token/字符（含"编号. "格式开销）
+            input_tokens = int(chars * 1.25)
+            # 译文(中文)通常比日文原文短约5%，中文约1token/字符
+            output_tokens = int(chars * 0.95)
             total_tokens = input_tokens + output_tokens
             model = self.model.get()
             price_per_million = MODEL_PRICES.get(model)
-            if price_per_million is not None:
-                if price_per_million == 0:
-                    return f"约{total_tokens:,}token（模型{model}有免费额度，{note}）"
-                cost = total_tokens / 1_000_000 * price_per_million
+            if price_per_million is None:
+                if verbose:
+                    return (f"约{total_tokens:,}token，按token计费"
+                            f"（模型{model or '未指定'}价格未知，{note}）")
+                return f"约{total_tokens:,}token，模型价格未知"
+            if price_per_million == 0:
+                return (f"约{total_tokens:,}token（模型{model}有免费额度，{note}）"
+                        if verbose else f"约{total_tokens:,}token（免费额度）")
+
+            # 批量请求的固定前缀（system提示+批量指令，64对齐后约448 token）每次都要发送，
+            # 批量翻译时它占输入token的大头，必须计入；DeepSeek前缀缓存命中后按命中价计。
+            n_req = self._estimate_request_count(entries)
+            prefix_tokens = EST_PREFIX_TOKENS * n_req
+            if n_req > 1:
+                total_tokens += prefix_tokens
+
+            # DeepSeek官方V4峰谷计价：高峰（工作日9-12/14-18点）全价，其余半价。
+            # 前缀按90%命中Prompt Cache估算（连续批量跑时命中率很高），动态输入按miss计。
+            # 仅当Base URL指向DeepSeek官方（api.deepseek.com）才套峰谷价；
+            # 中转站/硅基流动的deepseek-ai/*模型是平价计费，不走这里。
+            ml = (model or '').lower()
+            try:
+                base_l = (self.base_url.get() or '').lower()
+            except Exception:
+                base_l = ''
+            is_ds_official = 'deepseek.com' in base_l
+            if is_ds_official and 'deepseek-v4-flash' in ml:
+                peak_rates = (0.10, 3.00, 9.00)
+            elif is_ds_official and 'deepseek-v4-pro' in ml:
+                peak_rates = (0.30, 9.00, 27.00)
+            else:
+                peak_rates = None
+            if peak_rates:
+                hit_p, miss_p, out_p = peak_rates
+                is_peak, _bj = self._deepseek_offpeak()
+                factor = 1.0 if is_peak else 0.5
+                hit_r, miss_r, out_r = hit_p * factor, miss_p * factor, out_p * factor
+                cost = (prefix_tokens * 0.9 * hit_r + prefix_tokens * 0.1 * miss_r
+                        + input_tokens * miss_r + output_tokens * out_r) / 1_000_000
+                period = '高峰' if is_peak else '空闲'
+                if verbose:
+                    return (f"约{total_tokens:,}token，预计{cost:.2f}元"
+                            f"（DeepSeek官方{period}时段价，输出{out_r}元/百万token；"
+                            f"已计入{n_req:,}次请求×{EST_PREFIX_TOKENS}token固定前缀并按90%缓存命中估算，{note}）")
+                return f"预计{cost:.2f}元（{total_tokens:,} token，DeepSeek {period}）"
+
+            cost = (input_tokens + output_tokens + prefix_tokens) / 1_000_000 * price_per_million
+            if verbose:
                 return (f"约{total_tokens:,}token，预计{cost:.2f}元"
                         f"（模型{model}约{price_per_million}元/百万token，{note}）")
-            else:
-                return (f"约{total_tokens:,}token，按token计费"
-                        f"（模型{model or '未指定'}价格未知，{note}）")
+            return f"预计{cost:.2f}元（{total_tokens:,} token）"
 
-        return f"未知计费方式（{note}）"
+        return f"未知计费方式（{note}）" if verbose else "未知计费方式"
+
+    def _estimate_request_count(self, entries):
+        """按批量数估算请求次数：批量数>0时 ceil(条目/批量)，否则逐条（每条1次）。"""
+        if entries <= 0:
+            return 0
+        try:
+            bs = int(self.batch_size.get())
+        except Exception:
+            bs = 10
+        if bs <= 0:
+            return entries
+        return (entries + bs - 1) // bs
+
+    def _compute_ds_cost(self, chars, entries, model, is_peak, token_factor=1.0):
+        """计算 DeepSeek 官方 V4 模型指定档位的裸费用（元）。"""
+        ml = (model or '').lower()
+        if 'deepseek-v4-flash' in ml:
+            peak_rates = (0.10, 3.00, 9.00)
+        elif 'deepseek-v4-pro' in ml:
+            peak_rates = (0.30, 9.00, 27.00)
+        else:
+            return None
+        hit_p, miss_p, out_p = peak_rates
+        factor = 1.0 if is_peak else 0.5
+        hit_r, miss_r, out_r = hit_p * factor, miss_p * factor, out_p * factor
+        n_req = self._estimate_request_count(entries)
+        prefix_tokens = EST_PREFIX_TOKENS * n_req
+        input_tokens = int(chars * 1.25 * token_factor)
+        output_tokens = int(chars * 0.95 * token_factor)
+        cost = (prefix_tokens * 0.9 * hit_r + prefix_tokens * 0.1 * miss_r
+                + input_tokens * miss_r + output_tokens * out_r) / 1_000_000
+        return cost
 
     def _show_cost_estimate(self):
         inf = self.input_file.get()
@@ -7038,19 +7220,72 @@ class TranslatorApp:
             total_entries = len(data)
             translated_entries = sum(1 for k in data if k in self.translated)
             remaining_chars = sum(len(k) for k in data if k not in self.translated)
-            cost_info = self._estimate_cost(remaining_chars)
+            remaining_entries = total_entries - translated_entries
+            model = self.model.get() or ''
+
+            # DeepSeek 官方 V4 显示图表对比，其它引擎仍用简文本
+            base_l = (self.base_url.get() or '').lower()
+            is_ds_official = 'deepseek.com' in base_l
+            ml = model.lower()
+            if is_ds_official and ('deepseek-v4-flash' in ml or 'deepseek-v4-pro' in ml):
+                self._show_cost_chart(data, remaining_chars, remaining_entries, model)
+                return
+
+            cost_info = self._estimate_cost(remaining_chars, remaining_entries, verbose=False)
             msg = (
-                f"总条目: {total_entries}\n"
-                f"已翻译: {translated_entries}\n"
-                f"未翻译: {total_entries - translated_entries}\n"
-                f"总字符数: {total_chars}\n"
-                f"待翻译字符: {remaining_chars}\n"
-                f"引擎: {self.api_engine.get()}\n"
-                f"费用预估: {cost_info or '未知引擎'}"
+                f"待翻译: {remaining_entries} 条 / {remaining_chars} 字符\n"
+                f"模型: {model or '未指定'}\n"
+                f"预计费用: {cost_info or '未知引擎'}"
             )
             messagebox.showinfo("费用预估", msg)
         except Exception as e:
             messagebox.showerror("错误", f"统计失败: {e}")
+
+    def _show_cost_chart(self, data, chars, entries, model):
+        """用原生 ttk.Treeview 表格展示 DeepSeek V4 各档位费用对比。"""
+        win = tk.Toplevel(self.root)
+        win.title("费用预估 - DeepSeek V4")
+        win.resizable(True, False)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except Exception:
+            pass
+
+        info = ttk.Frame(win, padding=(12, 10, 12, 2))
+        info.pack(fill=tk.X)
+        ttk.Label(info, text=f"待翻译: {entries:,} 条 / {chars:,} 字符    模型: {model}",
+                  font=("Microsoft YaHei UI", 10)).pack(anchor=tk.W)
+
+        cols = ("档位", "现实值(元)", "保守上界(元)")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=5)
+        for c in cols:
+            tree.heading(c, text=c)
+        tree.column("档位", width=190, anchor=tk.W)
+        tree.column("现实值(元)", width=120, anchor=tk.E)
+        tree.column("保守上界(元)", width=140, anchor=tk.E)
+        tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
+
+        tree.tag_configure("rec", foreground="#1a7f37")
+        labels = [
+            "V4-Flash 空闲（推荐）",
+            "V4-Flash 高峰",
+            "V4-Pro 空闲",
+            "V4-Pro 高峰",
+        ]
+        models = ["deepseek-v4-flash", "deepseek-v4-flash",
+                  "deepseek-v4-pro", "deepseek-v4-pro"]
+        peaks = [False, True, False, True]
+        for label, m, p in zip(labels, models, peaks):
+            real = self._compute_ds_cost(chars, entries, m, p, token_factor=0.65) or 0
+            high = self._compute_ds_cost(chars, entries, m, p, token_factor=1.00) or 0
+            tag = ("rec",) if label.startswith("V4-Flash 空闲") else ()
+            tree.insert("", tk.END, values=(label, f"{real:.2f}", f"{high:.2f}"),
+                        tags=tag)
+
+        btn_frame = ttk.Frame(win, padding=(0, 4, 12, 10))
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="确定", command=win.destroy).pack(side=tk.RIGHT)
 
     # ==================== 详细统计报告 ====================
     def _show_detailed_stats(self):

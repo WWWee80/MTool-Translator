@@ -13,7 +13,7 @@ def _norm_rpgmv_ctrl(s):
     s = re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]\s*\[\s*\d+\s*\]", "", s)
     s = re.sub(r"\\[VvNnIiCcGgPpJjSsFfBbAaKk]", "", s)
     s = re.sub(r"\\n<[^>]+>", "", s)
-    s = re.sub(r"\\[<>.\\|!~$?#* ]", "", s)
+    s = re.sub(r"\\[<>.\|!~$?#* ]", "", s)
     return s.strip()
 
 import tkinter as tk
