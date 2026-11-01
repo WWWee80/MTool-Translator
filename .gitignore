@@ -18,3 +18,24 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# ===== 安全：绝不提交含 API Key 的配置与运行产物 =====
+auto_config.json
+auto_config.json.tmp
+config.json
+*.cfg
+translation_cache.json
+glossary/
+crash_log.txt
+ui_freeze_log.txt
+*.bak
+*.bak.*
+*.bak-*
+*~
+# 构建产物
+build/
+dist/
+*.spec
+build_exe.bat
+打包*.bat
+*.zip
