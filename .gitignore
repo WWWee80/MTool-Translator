@@ -1,19 +1,54 @@
-# Python
+# ==================== Python ====================
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
 
-# 本地配置与缓存（含 API Key，切勿提交）
+# ==================== 本地配置与凭据（含 API Key，切勿提交）====================
 auto_config.json
+auto_config.json.tmp
+config.json
 *.cfg
 translation_cache.json
 term_glossary.txt
+translator_config.cfg
 
-# 运行日志
+# ==================== 术语引擎数据（含从用户游戏提取的文本，属隐私面）====================
+glossary/
+
+# ==================== 运行日志（含 traceback / 线程栈 / 文件路径）====================
 ui_callback_errors.txt
+ui_freeze_log.txt
+crash_log.txt
+*.log
 
-# 本地测试目录
-_ttg_test/
-
-# 进度文件
+# ==================== 进度与中间产物 ====================
 trans_progress.json
 *.progress
+*.translated.json
+ManualTransFile.json
+*.tmp
+
+# ==================== 备份文件（防止 466KB 的旧版全文被 git add . 带走）====================
+*.bak
+*.bak.*
+*.bak-*
+*~
+
+# ==================== 本地测试目录 ====================
+_ttg_test/
+.trash/
+
+# ==================== 构建产物与打包（发布走 GitHub Releases，不入库）====================
+build/
+dist/
+*.spec
+build_exe.bat
+
+# ==================== 其它 ====================
+.DS_Store
+Thumbs.db
+desktop.ini

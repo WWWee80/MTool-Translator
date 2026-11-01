@@ -11,6 +11,8 @@ MTool翻译工具
 
 import json
 import re
+import csv
+import io
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -26,7 +28,7 @@ import random
 import tkinter as tk
 
 # ==================== 版本与更新 ====================
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 # GitHub 仓库地址（推送到 GitHub 后改成你的 用户名/仓库名）
 GITHUB_REPO = "WWWee80/MTool-Translator"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -34,14 +36,291 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 全局HTTP连接池（连接复用，避免每次TLS握手） ====================
-# num_pools: 不同主机的连接池数量；maxsize: 每个池的最大连接数；cert_reqs=CERT_NONE 跳过证书验证
+# num_pools: 不同主机的连接池数量；maxsize: 每个池的最大连接数
 # timeout: connect=5秒快速失败(避免网络抖动拖死并发槽)，read=60秒(大模型生成可能慢)
+#
+# 2026-11-01 安全加固：原先这里用 cert_reqs='CERT_NONE'（并 disable_warnings 压制告警），
+# 意味着所有主翻译请求——携带 Authorization: Bearer <API Key> 和用户全部游戏文本——
+# 都可以被中间人窃听/篡改，而用户完全无感知。
+# 实测（便携版 Python 3.14.7）：开校验后对 api.deepseek.com / api.siliconflow.cn /
+# github.com 全部握手正常（TLSv1.3），且能正确拦截 self-signed / expired 证书，
+# 说明关闭校验并非环境所迫。
+# 注意：便携版 ssl.get_default_verify_paths().cafile 为 None（只有 44 个 CA），
+# 必须显式指定 certifi 的 ca_certs 才能得到完整的 ~121 个根证书。
+def _ca_bundle_path():
+    """定位 CA 根证书包：优先 certifi（便携版已自带），退回到 OpenSSL 默认路径。"""
+    try:
+        import certifi
+        p = certifi.where()
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    try:
+        p = ssl.get_default_verify_paths().cafile
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    return None
+
+
+CA_BUNDLE = _ca_bundle_path()
+
 HTTP_POOL = urllib3.PoolManager(
-    num_pools=20, maxsize=64, retries=False, cert_reqs='CERT_NONE',
+    num_pools=20, maxsize=64, retries=False,
+    cert_reqs='CERT_REQUIRED',
+    ca_certs=CA_BUNDLE,
     timeout=urllib3.Timeout(connect=5.0, read=60.0)
 )
-# 禁用urllib3的InsecureRequestWarning（因为跳过了证书验证）
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# 不再全局压制 InsecureRequestWarning：正是它让证书异常完全静默。
+# 仅对「明确允许的不校验场景」（回环地址/自签名代理）在调用点局部忽略。
+
+
+def is_loopback_url(url):
+    """判断 URL 主机是否为回环/本机地址（Ollama、LM Studio 等本地服务）。
+
+    本地推理服务常以 http 或自签名证书提供，对它们豁免证书校验是可接受的
+    （流量不出网卡）；但该豁免必须以「host 是回环地址」为条件，
+    而不是像旧代码那样无条件关闭所有主机的校验。
+    """
+    try:
+        host = (urllib.parse.urlsplit(str(url or '')).hostname or '').strip().lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    if host in ('localhost', '::1', '0.0.0.0'):
+        return True
+    if host.startswith('127.'):
+        return True
+    return False
+
+
+def make_ssl_context(verify=True):
+    """构造 SSLContext。verify=False 仅用于回环/明确豁免场景。"""
+    if verify:
+        if CA_BUNDLE:
+            return ssl.create_default_context(cafile=CA_BUNDLE)
+        return ssl.create_default_context()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+
+def _atomic_write_text(path, text):
+    """原子写文本文件：先写 <path>.tmp 再 os.replace 覆盖。
+
+    2026-11-01 修复：项目多处 open(path,'w') 直写 JSON。若在写入中途关窗口/断电，
+    会留下半截 JSON，下次启动 json.load 直接失败（翻译缓存/进度/输出整体丢失）。
+    用同目录临时文件 + os.replace 保证替换原子性；临时文件由 os.replace 本身保证
+    要么全有要么全无，不会在目标路径留下半截内容。
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        # 跨盘/权限异常：退回直接写，保证功能不丢
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def _atomic_write_json(path, obj, indent=None):
+    """原子写 JSON 对象到磁盘（ensure_ascii=False 保留原文）。"""
+    flag = None if indent is None else indent
+    text = json.dumps(obj, ensure_ascii=False, indent=flag)
+    _atomic_write_text(path, text)
+
+
+# ==================== 文本条目读写（JSON / CSV / TSV） ====================
+# 2026-11-01 新增：原生 CSV/TSV 支持。
+# 主翻译流程原先硬编码 json.load/json.dump，用户问「CSV 能不能用」只能答不能。
+# 现在统一走下面两个函数按扩展名分派，6 处读取 + 4 处写回全部适配，
+# 并且 CSV 回写时保留原文件的表头、行序与额外列（ID/备注等），不破坏用户文件。
+
+TEXT_ENTRY_EXTS = {'.csv', '.tsv'}
+
+
+def _is_text_entry_file(path):
+    """判断输入文件是否为 CSV/TSV（其余按 JSON 处理，保持向后兼容）。"""
+    return os.path.splitext(str(path or ''))[1].lower() in TEXT_ENTRY_EXTS
+
+
+def _csv_sniff_layout(rows):
+    """探测 CSV 的列布局，返回列索引字典。
+
+    兼容两种常见形态：
+      A) 两列以上且首行像表头   → source/target 列 + 其余列原样保留
+      B) 单列                    → 每行一条原文（译文写回同列）
+    也支持无表头两列（按「第一列原文、第二列译文」处理）。
+    """
+    if not rows:
+        return {'source': 0, 'target': 1, 'id': None, 'header': None, 'single': False}
+    width = max(len(r) for r in rows)
+    if width <= 1:
+        return {'source': 0, 'target': 0, 'id': None, 'header': None, 'single': True}
+
+    # 表头识别：首行是常见列名（大小写/中英文均可）
+    first = [(c or '').strip().lower() for c in rows[0]]
+    src_names = {'source', 'src', '原文', '原句', '日文', 'japanese', 'text', 'key', 'original'}
+    tgt_names = {'target', 'tgt', '译文', '翻译', '中文', 'translation', 'translated', 'value'}
+    id_names = {'id', '编号', 'row', 'index', '序号'}
+    header = None
+    src_col = tgt_col = None
+    id_col = None
+    if first and any(v in src_names for v in first) and any(v in tgt_names for v in first):
+        header = rows[0]
+        for idx, name in enumerate(first):
+            if name in src_names and src_col is None:
+                src_col = idx
+            elif name in tgt_names and tgt_col is None:
+                tgt_col = idx
+            elif name in id_names and id_col is None:
+                id_col = idx
+    if src_col is None:
+        src_col, tgt_col = 0, 1
+    return {'source': src_col, 'target': tgt_col, 'id': id_col,
+            'header': header, 'single': False, 'width': width}
+
+
+def _read_text_entries(path):
+    """读取 JSON / CSV / TSV，统一返回 {'原文': '译文'} 字典。
+
+    JSON：原样 json.load（兼容 ManualTransFile.json 与 _mtool_meta）。
+    CSV/TSV：自动探测分隔符与列布局，把 source 列作键、target 列作值；
+            单列文件的值统一为空串（未翻译）。
+    译文的空格原样保留，不会 strip 掉——避免破坏游戏中需要前导空格的段落。
+    """
+    if not _is_text_entry_file(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    with open(path, 'r', encoding='utf-8-sig') as f:
+        raw = f.read()
+    # 分隔符探测：优先 tab，其次逗号，再退回分号
+    ext = os.path.splitext(str(path))[1].lower()
+    if ext == '.tsv':
+        delim = '\t'
+    else:
+        sample = raw[:4096]
+        delim = '\t' if sample.count('\t') > sample.count(',') else ','
+    rows = list(csv.reader(io.StringIO(raw), delimiter=delim))
+    rows = [r for r in rows if any((c or '').strip() for c in r)]
+    layout = _csv_sniff_layout(rows)
+    header_consumed = 1 if layout.get('header') else 0
+    src_col, tgt_col = layout['source'], layout['target']
+    out = {}
+    for r in rows[header_consumed:]:
+        src = r[src_col] if src_col < len(r) else ''
+        if not src:
+            continue
+        if layout.get('single'):
+            out[src] = ''
+        else:
+            tgt = r[tgt_col] if tgt_col < len(r) else ''
+            out[src] = tgt
+    return out
+
+
+def _write_text_entries(path, data, template_path=None):
+    """把 {'原文': '译文'} 写回 JSON / CSV / TSV。
+
+    CSV/TSV 回写策略：尽量沿用原文件既有行（含表头与额外列），只更新 target 列，
+    新增条目追加到末尾；这样不会因为翻译而打乱行序、丢失 ID 列。
+    `template_path`：当目标文件尚不存在（如输入 game.csv → 输出 game_translated.csv）时，
+    用该模板文件的行结构生成输出，保证 ID/备注等额外列不丢失。
+    JSON 直接走原子写。
+    """
+    if not _is_text_entry_file(path):
+        _atomic_write_json(path, data, indent=2)
+        return
+
+    ext = os.path.splitext(str(path))[1].lower()
+    delim = '\t' if ext == '.tsv' else ','
+    existing_rows = []
+    layout = None
+    # 目标文件已存在则沿用目标；否则退回到模板（通常是输入 CSV）
+    _src_for_layout = path if os.path.exists(path) else (template_path if template_path and os.path.exists(template_path) else None)
+    if _src_for_layout:
+        try:
+            with open(_src_for_layout, 'r', encoding='utf-8-sig') as f:
+                raw = f.read()
+            # 模板分隔符按模板文件自身扩展名判断
+            _tex = os.path.splitext(str(_src_for_layout))[1].lower()
+            if _tex == '.tsv':
+                delim = '\t'
+            else:
+                sample = raw[:4096]
+                delim = '\t' if sample.count('\t') > sample.count(',') else ','
+            reader_rows = list(csv.reader(io.StringIO(raw), delimiter=delim))
+            reader_rows = [r for r in reader_rows if any((c or '').strip() for c in r)]
+            layout = _csv_sniff_layout(reader_rows)
+            existing_rows = reader_rows
+        except Exception:
+            existing_rows = []
+            layout = None
+    if layout is None:
+        layout = {'source': 0, 'target': 1, 'id': None, 'header': None,
+                  'single': False, 'width': 2}
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=delim, lineterminator='\n')
+    written = set()
+
+    def _emit(row):
+        src_col = layout['source']
+        src = row[src_col] if src_col < len(row) else ''
+        if src in data and not layout.get('single'):
+            tgt_col = layout['target']
+            while len(row) <= tgt_col:
+                row.append('')
+            row[tgt_col] = data[src]
+            written.add(src)
+        writer.writerow(row)
+
+    if existing_rows:
+        start = 0
+        if layout.get('header'):
+            writer.writerow(existing_rows[0])
+            start = 1
+        for row in existing_rows[start:]:
+            _emit(row)
+    else:
+        if layout.get('header'):
+            writer.writerow(layout['header'])
+        if layout.get('single'):
+            for src in data:
+                writer.writerow([src])
+                written.add(src)
+        else:
+            tgt_col = layout['target']
+            width = max(layout.get('width') or 2, tgt_col + 1)
+            for src, tgt in data.items():
+                row = [''] * width
+                row[layout['source']] = src
+                row[tgt_col] = tgt
+                writer.writerow(row)
+                written.add(src)
+
+    # 新增条目（原文件里没有的）追加
+    for src, tgt in data.items():
+        if src in written:
+            continue
+        if layout.get('single'):
+            writer.writerow([src])
+        else:
+            tgt_col = layout['target']
+            width = max(layout.get('width') or 2, tgt_col + 1)
+            row = [''] * width
+            row[layout['source']] = src
+            row[tgt_col] = tgt
+            writer.writerow(row)
+
+    _atomic_write_text(path, buf.getvalue())
 
 
 def pool_request(method, url, body=None, headers=None, timeout=60):
@@ -59,9 +338,7 @@ def fetch_siliconflow_prices():
     改进版：解析Next.js内嵌JSON，支持转义引号，准确率高"""
     try:
         import urllib.request as _req
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx = make_ssl_context(verify=True)  # 硅基流动官网为公网主机，必须校验
         req = _req.Request('https://siliconflow.cn/pricing',
                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
         resp = _req.urlopen(req, context=ctx, timeout=15)
@@ -120,9 +397,9 @@ class TranslatorBase:
         self.timeout = timeout
         self._context_local = threading.local()  # 线程本地存储，避免多线程上下文错乱
         self.thread_min_interval = getattr(type(self), 'thread_min_interval', 0)  # 每线程最小请求间隔（秒），谷歌翻译设0.8防限流
-        self.ctx = ssl.create_default_context()
-        self.ctx.check_hostname = False
-        self.ctx.verify_mode = ssl.CERT_NONE
+        # 2026-11-01 安全加固：默认开启证书校验；仅当 base_url 指向本机回环地址
+        # （自建 Ollama/LM Studio，常为自签名）时才豁免，避免把「本地豁免」扩大到全网。
+        self.ctx = make_ssl_context(verify=not is_loopback_url(self.base_url))
 
     @property
     def context(self):
@@ -288,10 +565,20 @@ class GoogleTranslator(TranslatorBase):
         # 配置了代理池时跳过pygtrans，避免先撞60s超时才回退。
         if self._pygtrans_cls is not None and not self._proxy_list:
             try:
-                import urllib3
-                urllib3.disable_warnings()
                 client = self._pygtrans_cls()
-                client.session.verify = False  # 部分环境CA证书不全，禁用避免SSL报错
+                # 2026-11-01 安全加固：改为校验证书。translate.google.com 是公网主机，
+                # 原先 client.session.verify = False + 全局 disable_warnings 属默认不校验。
+                # 若部署环境 CA 确实不全（旧注释所称场景），可设环境变量
+                # MTOOL_ALLOW_INSECURE_TLS=1 显式退回，便于排障而不必改代码。
+                import os as _os
+                if _os.environ.get('MTOOL_ALLOW_INSECURE_TLS') == '1':
+                    client.session.verify = False
+                else:
+                    try:
+                        import certifi as _certifi
+                        client.session.verify = _certifi.where()
+                    except Exception:
+                        pass
                 src = source_lang if source_lang != 'auto' else 'auto'
                 result = client.translate(text, source=src, target=target_lang, timeout=self.timeout)
                 if result and getattr(result, 'translatedText', None):
@@ -372,10 +659,17 @@ class GoogleTranslator(TranslatorBase):
         """批量翻译：pygtrans原生支持列表，返回译文列表；pygtrans不可用时逐条翻译"""
         if self._pygtrans_cls is not None and not self._proxy_list:
             try:
-                import urllib3
-                urllib3.disable_warnings()
                 client = self._pygtrans_cls()
-                client.session.verify = False
+                # 2026-11-01 安全加固：与 translate() 保持一致，默认校验证书
+                import os as _os
+                if _os.environ.get('MTOOL_ALLOW_INSECURE_TLS') == '1':
+                    client.session.verify = False
+                else:
+                    try:
+                        import certifi as _certifi
+                        client.session.verify = _certifi.where()
+                    except Exception:
+                        pass
                 src = source_lang if source_lang != 'auto' else 'auto'
                 results = client.translate(texts, source=src, target=target_lang, timeout=self.timeout)
                 if results and isinstance(results, list):
@@ -903,6 +1197,29 @@ TRANSLATE_SYSTEM = """你是专业的游戏本地化翻译引擎。
 4. 除非原文明确表达，否则不要自行增加语气、信息或背景。
 """
 
+def _cache_text_key(src, tgt, text):
+    """统一本地缓存键：只规范换行和多余空白，不改动游戏原始字符。
+
+    模块级函数（不是哪个类的方法）——2026-11-01 修复：
+    本方法原先是 OpenAICompatTranslator 的 @staticmethod，但调用方在
+    TranslatorApp._translate_one 里写成 `self._cache_text_key(...)`，
+    而 TranslatorApp 无基类、无 __getattr__，运行时必抛
+    AttributeError: 'TranslatorApp' object has no attribute '_cache_text_key'。
+    该异常又被 _run_translate 的 `except Exception` 静默吞掉（只加失败计数不打日志），
+    导致以下路径 100% 失效：batch_size=0 的全部条目、所有 >500 字长文本、
+    批量解析失败后的降级、失败流转重试，以及不支持批量引擎（必应/腾讯/阿里/
+    IBM/MyMemory）的全部条目。提到模块级后两个类都能调用。
+
+    注意历史 bug：这里曾误写为 '\\\\r\\\\n' 和 r'[ \\\\t]+'，
+    前者匹配的是字面反斜杠+r（真实 CRLF 从未被归一化），
+    后者的字符集实际是「空格/反斜杠/字母t」，会把原文里每个 t 和 \\ 替换成空格，
+    导致 test/ttest/tttest 撞同一个键、返回错误译文。必须用真实控制字符。
+    """
+    normalized = str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+    normalized = re.sub(r'[ \t]+', ' ', normalized).strip()
+    return f"{src}|{tgt}|{normalized}"
+
+
 def _norm_base(u):
     """Base URL 归一化：兼容用户误把完整 /chat/completions 填进 Base URL 的写法，自动去掉重复后缀。
     例: https://x/v3/chat/completions -> https://x/v3 ；https://x/v1 -> 保持不变"""
@@ -1199,19 +1516,6 @@ class OpenAICompatTranslator(TranslatorBase):
             out.append(item)
             used += len(item) + 1
         return "\n".join(out)
-
-    @staticmethod
-    def _cache_text_key(src, tgt, text):
-        """统一本地缓存键：只规范换行和多余空白，不改动游戏原始字符。
-
-        注意历史 bug：这里曾误写为 '\\\\r\\\\n' 和 r'[ \\\\t]+'，
-        前者匹配的是字面反斜杠+r（真实 CRLF 从未被归一化），
-        后者的字符集实际是「空格/反斜杠/字母t」，会把原文里每个 t 和 \\ 替换成空格，
-        导致 test/ttest/tttest 撞同一个键、返回错误译文。必须用真实控制字符。
-        """
-        normalized = str(text or '').replace('\r\n', '\n').replace('\r', '\n')
-        normalized = re.sub(r'[ \t]+', ' ', normalized).strip()
-        return f"{src}|{tgt}|{normalized}"
 
     def set_cache_identity(self, task_key):
         """设置本轮翻译固定缓存身份；同一任务的所有请求共用。"""
@@ -2686,9 +2990,8 @@ class TranslatorApp:
                 if api_key:
                     headers['Authorization'] = f'Bearer {api_key}'
                 req = _req.Request(url, headers=headers)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                # 2026-11-01 安全加固：该请求携带 Bearer <api_key>，仅在回环地址豁免校验
+                ctx = make_ssl_context(verify=not is_loopback_url(url))
                 # Ollama本地模型：绕过系统代理，避免localhost请求被代理拦截返回502
                 if is_ollama:
                     proxy_handler = _req.ProxyHandler({})
@@ -3054,9 +3357,6 @@ class TranslatorApp:
         def run_fetch():
             try:
                 import urllib.request as _req
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
                 if is_ollama:
                     # Ollama: 使用 /api/tags 获取本地模型列表
                     # base可能是 http://localhost:11434 或 http://localhost:11434/v1
@@ -3067,9 +3367,8 @@ class TranslatorApp:
                     url = f"{_norm_base(base)}/models"
                     headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {api_key}'}
                 req = _req.Request(url, headers=headers)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                # 2026-11-01 安全加固：该请求携带 Bearer <api_key>，仅在回环地址豁免校验
+                ctx = make_ssl_context(verify=not is_loopback_url(url))
                 # Ollama本地模型：绕过系统代理，避免localhost请求被代理拦截返回502
                 if is_ollama:
                     proxy_handler = _req.ProxyHandler({})
@@ -3338,9 +3637,12 @@ class TranslatorApp:
             headers["Authorization"] = "Bearer " + v["api_key"]
         req = urllib.request.Request(v["chat_url"], data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                      headers=headers, method="POST")
-        ctx = ssl._create_unverified_context()
+        # 2026-11-01 安全加固：携带 Bearer <api_key> 的请求默认校验证书，
+        # 仅当目标是本机回环地址（自建 Ollama/LM Studio）时才豁免。
+        ctx = make_ssl_context(verify=not is_loopback_url(v["chat_url"]))
         if v.get("is_local"):
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                 urllib.request.HTTPSHandler(context=ctx))
             with opener.open(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
@@ -3366,13 +3668,14 @@ class TranslatorApp:
             headers = {"User-Agent": "Mozilla/5.0"}
             if v["api_key"]:
                 headers["Authorization"] = "Bearer " + v["api_key"]
-            ctx = ssl._create_unverified_context()
+            ctx = make_ssl_context(verify=not is_loopback_url(v.get("chat_url") or v.get("base") or ""))
             last_err = ""
             for url in urls:
                 try:
                     req = urllib.request.Request(url, headers=headers)
                     if v["is_local"]:
-                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                             urllib.request.HTTPSHandler(context=ctx))
                         resp = opener.open(req, timeout=30)
                     else:
                         resp = urllib.request.urlopen(req, context=ctx, timeout=30)
@@ -3734,12 +4037,20 @@ class TranslatorApp:
                 if os.path.exists(first):
                     path = first
         if path and os.path.isfile(path):
+            # 拖入非文本条目文件（图片/EXE等）时给出明确提示，避免误拖后静默失败
+            _ext = os.path.splitext(path)[1].lower()
+            if _ext not in ('.json', '.csv', '.tsv') and _ext not in ('.txt',):
+                self._log(f"⚠ 拖入的文件类型可能不受支持: {_ext}（支持 .json/.csv/.tsv）")
             self.input_file.set(path)
             self._glossary_reload_ui()
             self._glossary_auto_prepare()
             d = os.path.dirname(path)
             if not self.output_file.get() or os.path.basename(self.output_file.get()) == "ManualTransFile.json":
-                self.output_file.set(os.path.join(d, "ManualTransFile.json"))
+                base = os.path.splitext(os.path.basename(path))[0]
+                if _is_text_entry_file(path):
+                    self.output_file.set(os.path.join(d, base + "_translated" + os.path.splitext(path)[1].lower()))
+                else:
+                    self.output_file.set(os.path.join(d, "ManualTransFile.json"))
             if not self.progress_file.get() or os.path.basename(self.progress_file.get()) == "trans_progress.json":
                 self.progress_file.set(os.path.join(d, "trans_progress.json"))
             self._log(f"已拖入文件: {path}")
@@ -3747,19 +4058,35 @@ class TranslatorApp:
             self._log(f"拖入文件无效: {path}")
 
     def _browse_input(self):
-        f = filedialog.askopenfilename(filetypes=[("JSON文件", "*.json"), ("所有文件", "*.*")])
+        f = filedialog.askopenfilename(filetypes=[
+            ("文本条目文件", "*.json *.csv *.tsv"),
+            ("JSON文件", "*.json"),
+            ("CSV文件", "*.csv"),
+            ("TSV文件", "*.tsv"),
+            ("所有文件", "*.*"),
+        ])
         if f:
             self.input_file.set(f)
             self._glossary_reload_ui()
             self._glossary_auto_prepare()
             d = os.path.dirname(f)
             if not self.output_file.get() or os.path.basename(self.output_file.get()) == "ManualTransFile.json":
-                self.output_file.set(os.path.join(d, "ManualTransFile.json"))
+                # 输出保持 JSON：游戏注入只认 ManualTransFile.json。
+                # 若输入是 CSV，用户需要的是"译好的 CSV"，则输出同名 _translated.csv
+                base = os.path.splitext(os.path.basename(f))[0]
+                if _is_text_entry_file(f):
+                    ext = os.path.splitext(f)[1].lower()
+                    self.output_file.set(os.path.join(d, base + "_translated" + ext))
+                else:
+                    self.output_file.set(os.path.join(d, "ManualTransFile.json"))
             if not self.progress_file.get() or os.path.basename(self.progress_file.get()) == "trans_progress.json":
                 self.progress_file.set(os.path.join(d, "trans_progress.json"))
 
     def _browse_output(self):
-        f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON文件", "*.json")])
+        f = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON文件", "*.json"), ("CSV文件", "*.csv"),
+                       ("TSV文件", "*.tsv"), ("所有文件", "*.*")])
         if f:
             self.output_file.set(f)
 
@@ -3843,14 +4170,13 @@ class TranslatorApp:
         if tgt == "auto":
             tgt = "zh-CN"
 
-        # 后台线程执行读取+扫描，避免大JSON卡住UI
+        # 后台线程执行读取+扫描，避免大文件卡住UI
         def _scan_worker():
             try:
-                with open(inf, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                data = _read_text_entries(inf)
             except Exception as e:
-                self.root.after(0, lambda: (messagebox.showerror("错误", f"读取JSON失败：{e}"),
-                                            self.status_label.config(text="检测失败：读取JSON出错")))
+                self.root.after(0, lambda: (messagebox.showerror("错误", f"读取文件失败：{e}"),
+                                            self.status_label.config(text="检测失败：读取文件出错")))
                 return
             _scan(data)
 
@@ -4031,15 +4357,13 @@ class TranslatorApp:
                 data[source] = source  # 恢复为原文（未翻译状态）
                 if source in self.translated:
                     del self.translated[source]
-            # 保存回JSON文件
+            # 保存回源文件（JSON/CSV/TSV 自动适配）
             try:
-                with open(inf, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                _write_text_entries(inf, data)
                 # 保存进度文件
                 pf = self.progress_file.get()
                 if pf:
-                    with open(pf, 'w', encoding='utf-8') as f:
-                        json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                    _atomic_write_json(pf, self.translated, indent=2)
                 self._log(f"已清空 {len(selected)} 条翻译不全的条目译文，可重新翻译")
                 messagebox.showinfo("完成", f"已清空 {len(selected)} 条译文。\n点击「开始翻译」即可重新翻译这些条目。", parent=dlg)
                 dlg.destroy()
@@ -4082,12 +4406,10 @@ class TranslatorApp:
                         if source in self.translated and self.translated[source] != source:
                             data[source] = self.translated[source]
                             updated += 1
-                    with open(inf, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    _write_text_entries(inf, data)
                     pf = self.progress_file.get()
                     if pf:
-                        with open(pf, 'w', encoding='utf-8') as f:
-                            json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                        _atomic_write_json(pf, self.translated, indent=2)
                     self._log(f"翻译校准→LLM精修：{len(force_items)} 条已精修，成功更新 {updated} 条，已保存")
                     # 在主线程收尾：弹窗可能已被用户关闭，需 winfo_exists 保护
                     def _done():
@@ -4146,9 +4468,9 @@ class TranslatorApp:
         if not inf or not os.path.exists(inf):
             messagebox.showwarning("提示", "请先选择输入文件")
             return
-        with open(inf, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        diff = sum(1 for k, v in data.items() if k != v)
+        data = _read_text_entries(inf)
+        # 已翻译判定：值非空且不等于原文。CSV 的"未翻译"是空串，不能简单用 k != v
+        diff = sum(1 for k, v in data.items() if v and v != k)
         messagebox.showinfo("统计", f"总条目: {len(data)}\n已翻译: {diff}\n未翻译: {len(data)-diff}\n进度文件: {len(self.translated)} 条")
 
     def _classify_error(self, err):
@@ -4332,6 +4654,44 @@ class TranslatorApp:
             result = result.replace(marker, original)
             result = re.sub(re.escape(marker), lambda m: original, result, flags=re.IGNORECASE)
         return result
+
+    def _chunk_protected_text(self, text, chunk_size):
+        r"""在「不切碎保护标记」的前提下，把已保护的文本切成 ≤chunk_size 的多个片段。
+
+        保护标记为原子单元：〔NL\d+〕、〔PHX\d+〕、⟦LIT\d+⟧（及大小写/括号变体）。
+        切块边界只允许落在普通字符之间，绝不落在标记内部，从而保证每个片段里的
+        占位符/换行标记都完整，还原时不会出现残块。
+        """
+        chunk_size = max(8, int(chunk_size or 2000))
+        if len(text) <= chunk_size:
+            return [text]
+        # 标记的完整形态（含大小写与中/英/全角括号变体）
+        marker_re = re.compile(r'[〔\[【⟦](?:NL|PHX|LIT)\d+[〕\]】⟧]', re.IGNORECASE)
+        n = len(text)
+        # 在位置 i 切开（左块含 text[:i]，右块含 text[i:]）若 i 严格落在某标记中部
+        # （start < i < end）就会把标记一分为二，不安全；i == start 或 i == end 都安全。
+        # 因此只把 (start, end) 内部的坐标标为不可切。
+        unsafe = [False] * n
+        for m in marker_re.finditer(text):
+            for i in range(m.start() + 1, m.end()):
+                if i < n:
+                    unsafe[i] = True
+        chunks = []
+        start = 0
+        while start < n:
+            end = min(start + chunk_size, n)
+            # 若 end 落在标记内部，回退到该位置前最近的安全边界
+            orig_end = end
+            if end < n and unsafe[end]:
+                while end > start and unsafe[end]:
+                    end -= 1
+                # 兜底：若 [start, orig_end) 全被标记内部占据（极端密集标记），强制切在
+                # orig_end 保证进度、杜绝死循环（仅极端情形触发；标记应原子，但此处不会丢数据）
+                if end == start:
+                    end = orig_end
+            chunks.append(text[start:end])
+            start = end
+        return chunks
 
     def _is_code_or_noise(self, text):
         """判断原文是否为代码/样式/着色器/乱码等非自然语言文本（如 GLSL 着色器、CSS 选择器、
@@ -4544,7 +4904,10 @@ class TranslatorApp:
             elif self._embedding_should_skip(text):
                 return text
         # 翻译缓存：相同文本+语言方向直接返回，避免重复翻译（游戏UI文本重复率高）
-        cache_key = self._cache_text_key(src, tgt, text)
+        # 2026-11-01 修复：此处原为 self._cache_text_key(...)，但该方法当时只定义在
+        # OpenAICompatTranslator 上，TranslatorApp 无基类/无 __getattr__，必抛
+        # AttributeError 并被上层静默吞掉。现改为调用模块级函数。
+        cache_key = _cache_text_key(src, tgt, text)
         if cache_key in self.translation_cache:
             return self.translation_cache[cache_key]
         # 兼容旧版缓存键：首次命中旧键后自动迁移到规范化键，避免升级后重新花API费用。
@@ -4610,15 +4973,21 @@ class TranslatorApp:
         # 分段前先统一换行符，避免\r\n被分段截断导致双换行
         text = text.replace('\r\n', '\n').replace('\r', '\n')
         if len(text) > chunk_size:
-            chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+            # 2026-11-01 修复：原先在此用 text[i:i+chunk_size] 裸下标切块，若切块边界
+            # 恰好落在占位符中间（如 {name} 被切成 chunk1="{name"、chunk2="}"），两块
+            # 各自 _protect_text 都匹配不到完整占位符 → 不保护 → LLM 把残缺占位符当普通
+            # 文本乱译/丢掉，译文里占位符丢失。现改为：先对整段文本做一次保护（NL/PHX 标记
+            # 编号全局唯一），再在「不切开标记」的基础上切块。literal 区间可任意切割，
+            # 标记单元（〔NL0〕/〔PHX0〕/⟦LIT0⟧）视为原子整体。
+            protected_all, mapping_all = self._protect_text(text)
+            chunks = self._chunk_protected_text(protected_all, chunk_size)
             result = ''
             for chunk in chunks:
-                protected, mapping = self._protect_text(chunk)
-                r = _do_translate(protected)
+                r = _do_translate(chunk)
                 try:
-                    r = self._restore_text(r, mapping)
+                    r = self._restore_text(r, mapping_all)
                 except Exception:
-                    for marker, original in mapping:
+                    for marker, original in mapping_all:
                         r = r.replace(marker, original)
                 result += r
                 # 更新上下文（仅LLM引擎有效）
@@ -4701,8 +5070,7 @@ class TranslatorApp:
     def _save_translation_cache(self):
         """保存翻译缓存到磁盘"""
         try:
-            with open(self._cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.translation_cache, f, ensure_ascii=False)
+            _atomic_write_json(self._cache_file, self.translation_cache, indent=None)
         except Exception:
             pass
 
@@ -4769,14 +5137,14 @@ class TranslatorApp:
                 self._log(f"加载已有翻译: {len(self.translated)} 条")
 
         try:
-            with open(inf, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self._log(f"❌ 输入文件不是有效的JSON: {e}")
+            data = _read_text_entries(inf)
+        except (json.JSONDecodeError, UnicodeDecodeError, csv.Error) as e:
+            self._log(f"❌ 输入文件不是有效的JSON/CSV: {e}")
             messagebox.showerror("文件格式错误",
-                f"输入文件不是有效的JSON格式：\n{inf}\n\n"
+                f"输入文件格式无法识别：\n{inf}\n\n"
                 f"错误: {e}\n\n"
-                f"请选择游戏文本JSON文件（如 ManualTransFile.json），不要拖入.py/.txt等其他格式文件。")
+                f"请选择游戏文本文件（.json / .csv / .tsv），如 ManualTransFile.json，\n"
+                f"不要拖入.py/.txt/图片等其他格式文件。")
             self.start_btn.config(state="normal")
             self.pause_btn.config(state="disabled")
             self.stop_btn.config(state="disabled")
@@ -4851,7 +5219,12 @@ class TranslatorApp:
                 self._log("🧠 embedding智能免翻: 扫描完成，未发现可跳过条目")
         except Exception as e:
             self._log(f"⚠ embedding智能免翻扫描异常: {e}")
-        self._start_translate_phase2(to_translate, data, src, tgt, use_engine_b)
+        # 2026-11-01 修复：_start_translate_phase2 内含 UI 写（progress_bar、_log、以及
+        # “无待翻译条目”时的 _finish → 各按钮 config + status_label + messagebox）。
+        # _embed_scan_and_start 在本后台线程执行，直接调用会把 UI 操作放到非主线程，
+        # 造成 Tkinter 线程安全崩溃（尤其 _finish 内弹模态框与主循环互等假死）。
+        # 故把（仅）启动阶段派发回主线程；translator 启动线程仍由 phase2 内部起。
+        self.root.after(0, lambda: self._start_translate_phase2(to_translate, data, src, tgt, use_engine_b))
 
     def _start_translate_phase2(self, to_translate, data, src, tgt, use_engine_b):
         self.to_translate = to_translate  # 保存供结束时统计实际失败数
@@ -4955,6 +5328,15 @@ class TranslatorApp:
             if m:
                 idx = int(m.group(1))
                 content = m.group(2).strip()
+                # 2026-11-01 修复：编号必须落在 1..expected_count 内。
+                # 原代码不校验 idx，模型输出 "0. xxx"（续编号/从0开始的列表）时
+                # idx=0 → len(results_old)==idx-1 是 0==-1(假) → 落到
+                # elif idx-1 < len(results_old) 即 -1 < 0(真) → results_old[-1]=content
+                # 对空列表赋值 → IndexError。该异常会经 _translate_batch_worker 的
+                # except 重试 3 次拿到同样输出后 break，再降级单条，最终整批条目丢失。
+                # idx 超出上界时旧代码走 else 分支盲目 append，同样会错位。
+                if not (1 <= idx <= expected_count):
+                    continue
                 while len(results_old) < idx - 1:
                     results_old.append(None)
                 if len(results_old) == idx - 1:
@@ -4982,6 +5364,35 @@ class TranslatorApp:
             return valid_old[:expected_count]
         return None
 
+    def _wait_if_paused(self):
+        """暂停闸门：在暂停期间阻塞，直到用户继续或停止。
+
+        2026-11-01 修复：原先 is_paused 只在 _translate_one 内部检查（唯一检查点），
+        而 LLM 引擎默认走批量（_translate_batch_worker）和精修 worker，它们只看
+        should_stop。结果是：点「暂停」后 UI 显示"已暂停"，但请求照发、进度照走、
+        API 费用照花——用户以为暂停生效，实际完全没有。
+        所有在后台线程里循环发请求的地方都应调用本方法。
+        """
+        while self.is_paused and not self.should_stop:
+            time.sleep(0.3)
+
+    def _ui(self, fn, *args, **kwargs):
+        """跨线程 UI 更新的唯一入口：把 fn 派发到主线程执行。
+
+        - 主线程：直接同步执行（避免多一次事件循环跳转）
+        - 后台线程：self.root.after(0, ...) 排队到主线程
+
+        2026-11-01 修复：项目有 13 处后台线程直接写 widget/StringVar
+        （cache_warmup_var.set 等），此后台线程只依赖 GIL 与 CPython 实现细节，
+        属未定义行为。所有跨线程 UI 写应改走本方法。
+        """
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+        elif hasattr(self, 'root') and getattr(self.root, 'winfo_exists', lambda: True)():
+            self.root.after(0, lambda: fn(*args, **kwargs))
+        else:  # root 已销毁或未就绪——UI 已关闭，丢弃这次更新
+            return
+
     def _translate_batch_worker(self, batch, translator, src, tgt):
         """批量翻译一个批次，返回 [(原文,译文),...]，失败返回空列表。带3次指数退避重试。"""
         # 保护每条文本中的换行符（防止LLM丢失换行后的内容）
@@ -4993,6 +5404,7 @@ class TranslatorApp:
             mappings.append(mapping)
         max_retry = 3
         for attempt in range(max_retry + 1):
+            self._wait_if_paused()  # 2026-11-01：批量路径原先不支持暂停
             if self.should_stop:
                 return []
             try:
@@ -5106,12 +5518,13 @@ class TranslatorApp:
                 self._log(f"⚠ 设置Prompt Cache身份失败：{_e}")
             try:
                 _vendor = "TokenHub" if translator._is_tokenhub() else "DeepSeek"
-                self.cache_warmup_var.set("预热：正在自动建立固定前缀缓存…")
+                # 2026-11-01：跨线程 StringVar 写 → 派发主线程
+                self._ui(self.cache_warmup_var.set, "预热：正在自动建立固定前缀缓存…")
                 ok, msg = translator.warmup_cache(src, tgt)
-                self.cache_warmup_var.set(("预热：成功 · " if ok else "预热：失败 · ") + msg)
+                self._ui(self.cache_warmup_var.set, ("预热：成功 · " if ok else "预热：失败 · ") + msg)
                 self._log(("✅ " if ok else "⚠ ") + f"{_vendor}自动缓存预热：" + msg)
             except Exception as e:
-                self.cache_warmup_var.set(f"预热：失败 · {str(e)[:120]}")
+                self._ui(self.cache_warmup_var.set, f"预热：失败 · {str(e)[:120]}")
                 self._log(f"⚠ 自动缓存预热异常：{e}")
 
         # Ollama本地模型预热：提前加载模型到内存，避免第一条翻译因加载超时
@@ -5394,14 +5807,14 @@ class TranslatorApp:
             if isinstance(translator, OpenAICompatTranslator) and (translator._is_deepseek() or translator._is_tokenhub()):
                 try:
                     _vendor = "TokenHub" if translator._is_tokenhub() else "DeepSeek"
-                    self.cache_warmup_var.set(f"预热：正在预热引擎{label}…")
+                    self._ui(self.cache_warmup_var.set, f"预热：正在预热引擎{label}…")
                     ok, msg = translator.warmup_cache(src, tgt)
                     self._log(("✅ " if ok else "⚠ ") + f"{_vendor}引擎{label}自动缓存预热：" + msg)
                 except Exception as e:
                     self._log(f"⚠ 引擎{label}自动缓存预热异常：{e}")
         if any(isinstance(t, OpenAICompatTranslator) and (t._is_deepseek() or t._is_tokenhub())
                for t in self._active_cache_translators):
-            self.cache_warmup_var.set("预热：自动预热已执行")
+            self._ui(self.cache_warmup_var.set, "预热：自动预热已执行")
 
         workers_a = self.max_workers.get()
         workers_b = self.engine_b_workers.get()
@@ -5697,9 +6110,9 @@ class TranslatorApp:
         def run_fetch():
             try:
                 import urllib.request as _req
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                # 2026-11-01 安全加固：Ollama 地址默认为回环，但仍按实际 host 判断，
+                # 避免用户把 semantic_ollama_url 指到远程时也跳过校验。
+                ctx = make_ssl_context(verify=not is_loopback_url(base))
                 # 绕过系统代理，避免localhost请求被代理拦截
                 proxy_handler = _req.ProxyHandler({})
                 opener = _req.build_opener(proxy_handler, _req.HTTPSHandler(context=ctx))
@@ -5817,9 +6230,8 @@ class TranslatorApp:
                 return None
             import ssl as _ssl
             import urllib.request as _req
-            ctx = _ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
+            # 2026-11-01 安全加固：按实际 host 判断，回环地址才豁免校验
+            ctx = make_ssl_context(verify=not is_loopback_url(base))
             opener = _req.build_opener(_req.ProxyHandler({}), _req.HTTPSHandler(context=ctx))
             payload = json.dumps({"model": model, "prompt": text}).encode('utf-8')
             req = _req.Request(f"{base}/api/embeddings", data=payload,
@@ -5909,9 +6321,8 @@ class TranslatorApp:
             return self._semantic_cache[cache_key]
         try:
             import urllib.request as _req
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            # 2026-11-01 安全加固：按实际 host 判断，回环地址才豁免校验
+            ctx = make_ssl_context(verify=not is_loopback_url(base))
             proxy_handler = _req.ProxyHandler({})
             opener = _req.build_opener(proxy_handler, _req.HTTPSHandler(context=ctx))
             # 调用Ollama /api/embeddings
@@ -6065,7 +6476,11 @@ class TranslatorApp:
             return
         # 显示检测结果
         self._log(f"翻译校准完成：扫描{checked}条（汉字预筛通过{precheck_pass}条），检出{len(issues)}条可能术语错误")
-        self._show_semantic_issues_dialog(issues, data, src, tgt)
+        # 2026-11-01 修复：_run_semantic_check 在 _finish 起的后台线程里执行，
+        # 直接调用 _show_semantic_issues_dialog 会在非主线程创建整棵 Toplevel 控件树，
+        # 这是 Tkinter 最典型的崩溃场景（对话框空白/进程崩溃，且线程异常走不到 callback 钩子）。
+        # 必须派发回主线程再建对话框；这是本项目既有的正确写法（对照 _run_calibrate_then_refine）。
+        self.root.after(0, lambda: self._show_semantic_issues_dialog(issues, data, src, tgt))
 
     def _show_semantic_issues_dialog(self, issues, data, src, tgt):
         """显示语义校验检出的术语错误条目对话框，支持勾选后清空译文重新翻译 或 直接送LLM精修"""
@@ -6149,12 +6564,10 @@ class TranslatorApp:
                 if source in self.translated:
                     del self.translated[source]
             try:
-                with open(inf, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                _write_text_entries(inf, data)
                 pf = self.progress_file.get()
                 if pf:
-                    with open(pf, 'w', encoding='utf-8') as f:
-                        json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                    _atomic_write_json(pf, self.translated, indent=2)
                 self._log(f"翻译校准：已清空 {len(selected)} 条术语错误条目译文，可重新翻译")
                 messagebox.showinfo("完成", f"已清空 {len(selected)} 条译文。\n点击「开始翻译」即可重新翻译这些条目。", parent=dlg)
                 dlg.destroy()
@@ -6193,12 +6606,10 @@ class TranslatorApp:
                         if source in self.translated and self.translated[source] != source:
                             data[source] = self.translated[source]
                             updated += 1
-                    with open(inf, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    _write_text_entries(inf, data)
                     pf = self.progress_file.get()
                     if pf:
-                        with open(pf, 'w', encoding='utf-8') as f:
-                            json.dump(self.translated, f, ensure_ascii=False, indent=2)
+                        _atomic_write_json(pf, self.translated, indent=2)
                     self._log(f"翻译校准→LLM精修：{len(force_items)} 条已精修，成功更新 {updated} 条，已保存")
                     # 在主线程收尾：弹窗可能已被用户关闭，需 winfo_exists 保护
                     def _done():
@@ -6663,6 +7074,7 @@ class TranslatorApp:
                 if self.should_stop:
                     return None
                 for attempt in range(4):
+                    self._wait_if_paused()  # 2026-11-01：精修路径原先不支持暂停
                     if self.should_stop:
                         return None
                     try:
@@ -6716,6 +7128,7 @@ class TranslatorApp:
                 if self.should_stop:
                     return []
                 for attempt in range(4):
+                    self._wait_if_paused()  # 2026-11-01：精修路径原先不支持暂停
                     if self.should_stop:
                         return []
                     try:
@@ -6845,28 +7258,41 @@ class TranslatorApp:
         if pf:
             # 同样剔除垃圾条目，避免进度文件被乱码/资源名撑到数MB（垃圾不在翻译队列，无需进度记录）
             slim = {k: v for k, v in self.translated.items() if not self._should_skip_translation(k)}
-            with open(pf, 'w', encoding='utf-8') as f:
-                json.dump(slim, f, ensure_ascii=False)
+            _atomic_write_json(pf, slim, indent=None)
 
     def _save_output(self, data):
         outf = self.output_file.get()
         if outf:
             final = {}
             skipped = 0
+            # 2026-09-30 修复：输出不再物理删除条目。
+            # 原实现把 _should_skip_translation() 当成“是否保留”的判据，命中就从输出 JSON 里删键，
+            # 但该方法的本意只是“是否送翻译”的启发式（含斜杠、编号标签、短数值、方括号 UI 标签、
+            # 富文本等正常游戏文本都会命中），删键后游戏内查不到映射 → 该处回落日文原文，
+            # 表现为“输出文件从 2MB 变成 500KB、很多句子没了”。实测典型日文文本误杀率约 34%。
+            # 现在统一写回：优先用本次译文，其次保留输入文件里已有的值，最后才用原文键。
+            # 确实想剔除乱码条目（Unity 提取文件的资源名/二进制碎片）时，
+            # 在 auto_config.json 里加 "drop_junk_entries": true 即可恢复旧行为。
+            drop_junk = bool(getattr(self, '_auto_cfg', {}).get('drop_junk_entries', False))
             for k in data:
-                # 剔除提取垃圾/乱码/资源名/路径/日汉同形等无需翻译的条目，避免输出文件被
-                # 37万条"译文==原文"的垃圾撑爆（96% 的 Unity 二进制乱码不该出现在输出里）
-                if self._should_skip_translation(k):
+                if drop_junk and self._should_skip_translation(k):
                     skipped += 1
                     continue
-                final[k] = self.translated.get(k, k)
+                final[k] = self.translated.get(k, data.get(k, k))
             # 写回 Unity 特征码（读取时已从 data 弹出，保存时还原，避免 meta 被当条目翻译）
             if self._file_meta:
                 final['_mtool_meta'] = self._file_meta
-            with open(outf, 'w', encoding='utf-8') as f:
-                json.dump(final, f, ensure_ascii=False, indent=2)
+            # 按输出扩展名分派：.json → JSON（游戏注入标准格式）；.csv/.tsv → 输出表格
+            if _is_text_entry_file(outf):
+                # 输出表格若尚不存在，用输入文件当模板，保留 ID/备注等额外列与行序
+                _write_text_entries(outf, final, template_path=self.input_file.get() or None)
+            else:
+                _atomic_write_json(outf, final, indent=2)
             eff = len(final) - (1 if self._file_meta else 0)
-            self._log(f"输出已保存: {outf}（有效{eff}条，剔除垃圾{skipped}条）")
+            if skipped:
+                self._log(f"输出已保存: {outf}（共{eff}条，剔除乱码{skipped}条）")
+            else:
+                self._log(f"输出已保存: {outf}（共{eff}条，输入条目全部保留）")
 
     def _stop_translate(self):
         self.should_stop = True
@@ -6955,6 +7381,12 @@ class TranslatorApp:
         )
 
     def _finish(self):
+        # 2026-11-01 线程安全守卫：_finish 直接操作 Tk 控件（按钮 config、status_label、
+        # messagebox），必须在主线程执行。此前被 embedding 后台线程直接调用导致崩溃。
+        # 该 assert 会在开发期（未 -O 运行）立即暴露此类回归；若因 -O 失效，
+        # 会转而在下一次 Tk 调用自然暴露。请勿在后台线程绕过 after 直接调用。
+        assert threading.current_thread() is threading.main_thread(), \
+            "_finish 必须在主线程调用（请用 self.root.after(0, self._finish) 派发）"
         self.is_running = False
         self.is_paused = False
         self.total_elapsed = time.time() - self.start_time if self.start_time else 0
@@ -7003,8 +7435,7 @@ class TranslatorApp:
             try:
                 inf = self.input_file.get()
                 if inf and os.path.exists(inf):
-                    with open(inf, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+                    data = _read_text_entries(inf)
                     src_c = self._get_lang_code(self.source_lang.get())
                     tgt_c = self._get_lang_code(self.target_lang.get())
                     if tgt_c == "auto":
@@ -7214,8 +7645,7 @@ class TranslatorApp:
             messagebox.showwarning("提示", "请先选择输入文件")
             return
         try:
-            with open(inf, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = _read_text_entries(inf)
             total_chars = sum(len(k) for k in data)
             total_entries = len(data)
             translated_entries = sum(1 for k in data if k in self.translated)
@@ -7294,13 +7724,19 @@ class TranslatorApp:
             messagebox.showwarning("提示", "请先选择输入文件")
             return
         try:
-            with open(inf, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            data = _read_text_entries(inf)
             total = len(data)
-            translated = sum(1 for k in data if k != self.translated.get(k, k) and k in self.translated)
+            # 已翻译 = 进度里有真译文，或源文件里已有非空的译文（CSV 未翻译为空串）
+            translated = sum(
+                1 for k in data
+                if (k in self.translated and self.translated[k] and self.translated[k] != k)
+                or (data.get(k) and data.get(k) != k))
             untranslated = total - translated
             total_chars = sum(len(k) for k in data)
-            translated_chars = sum(len(k) for k in data if k in self.translated and self.translated[k] != k)
+            translated_chars = sum(
+                len(k) for k in data
+                if (k in self.translated and self.translated[k] and self.translated[k] != k)
+                or (data.get(k) and data.get(k) != k))
             avg_speed = (self.count / self.total_elapsed) if self.total_elapsed > 0 else 0
 
             report = (
@@ -7363,12 +7799,14 @@ class TranslatorApp:
     # ==================== 自动保存配置 ====================
     def _load_auto_config(self):
         """启动时加载自动保存的配置"""
+        self._auto_cfg = {}
         if not os.path.exists(self._config_file):
             return
         try:
             self._loading_config = True
             with open(self._config_file, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
+            self._auto_cfg = cfg  # 供 _save_output 读取 drop_junk_entries 等非 UI 配置项
             # 用 _safe_set 包装每个变量设置，单个失败不影响其他
             def _safe(var, val):
                 try: var.set(val)
@@ -7429,6 +7867,11 @@ class TranslatorApp:
             # embedding 智能识别免翻内容
             _safe(self.embed_skip_enable, cfg.get("embed_skip_enable", False))
             _safe(self.embed_skip_threshold, cfg.get("embed_skip_threshold", 0.30))
+            # 术语引擎 AI 连接（2026-11-01 修复：原先只存不载，重启后 Key 为空）
+            _safe(self.glossary_ai_base_url, cfg.get("glossary_ai_base_url", AGNES_CHAT_BASE))
+            _safe(self.glossary_ai_api_key, cfg.get("glossary_ai_api_key", ""))
+            _safe(self.glossary_ai_model, cfg.get("glossary_ai_model", AGNES_CHAT_MODEL))
+            _safe(self.glossary_ai_preset, cfg.get("glossary_ai_preset", "Agnes(默认)"))
             try:
                 self._on_api_change()
             except Exception:
@@ -7465,7 +7908,11 @@ class TranslatorApp:
                     self.enable_semantic_check, self.semantic_ollama_url,
                     self.semantic_model, self.semantic_threshold,
                     # embedding 智能识别免翻内容
-                    self.embed_skip_enable, self.embed_skip_threshold]:
+                    self.embed_skip_enable, self.embed_skip_threshold,
+                    # 术语引擎 AI 连接（2026-11-01 修复：原先遗漏，导致重启后 Key 丢失、
+                    # 术语自动分类永不触发、pending_terms 无限积压）
+                    self.glossary_ai_base_url, self.glossary_ai_api_key,
+                    self.glossary_ai_model, self.glossary_ai_preset]:
             var.trace_add("write", self._auto_save_config)
 
     def _auto_save_config(self, *args):
@@ -7524,9 +7971,28 @@ class TranslatorApp:
                 # embedding 智能识别免翻内容
                 "embed_skip_enable": self.embed_skip_enable.get(),
                 "embed_skip_threshold": self.embed_skip_threshold.get(),
+                # 术语引擎（AI 分类/翻译所用的 LLM 连接）
+                # 2026-11-01 修复：这 4 个变量原先既不进本字典、也不进 _setup_auto_save
+                # 的变量表，导致每次重启 glossary_ai_api_key 都为空 →
+                # _glossary_auto_prepare 的自动分类条件恒假 → pending_terms.json 只增不减
+                # （实测多个游戏目录积压 3000~4349 条 / 79~119KB）。
+                "glossary_ai_base_url": self.glossary_ai_base_url.get(),
+                "glossary_ai_api_key": self.glossary_ai_api_key.get(),
+                "glossary_ai_model": self.glossary_ai_model.get(),
+                "glossary_ai_preset": self.glossary_ai_preset.get(),
             }
-            with open(self._config_file, 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            # 2026-11-01 修复：保留配置文件里本 UI 不管理的键（如 drop_junk_entries）。
+            # 原实现是整文件覆盖写，用户手写的 "drop_junk_entries": true 会在任何一次
+            # 改动设置后被抹掉，表现为「开关本次生效、重启失效」。
+            merged = dict(getattr(self, '_auto_cfg', {}) or {})
+            merged.update(cfg)
+            # 原子写：先写临时文件再 os.replace，避免断电/杀进程留下半截 JSON
+            # 导致下次启动 json.load 失败、整份配置（含 API Key）静默丢失。
+            tmp = self._config_file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._config_file)
+            self._auto_cfg = merged
         except Exception:
             pass  # 自动保存失败静默跳过
 
@@ -8209,6 +8675,23 @@ def _apply_config_json(app):
         pass
 
 
+def _app_base_dir():
+    """返回"用户可见的应用根目录"。
+
+    2026-11-01 修复：PyInstaller onefile 模式下 __file__ 指向临时解包目录，
+    程序退出即被清理。原先崩溃日志/配置路径用 __file__ 推导，导致 EXE 版：
+      1) crash_log.txt 写到临时目录，用户永远看不到；
+      2) auto_config.json 保存后下次启动丢失（每次都是新临时目录）。
+    frozen 时改用 sys.executable（真实 exe 所在目录）推导。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
 def main():
     # 尝试启用拖拽支持
     try:
@@ -8227,7 +8710,7 @@ def main():
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+        log_path = os.path.join(_app_base_dir(), "crash_log.txt")
         try:
             with open(log_path, 'w', encoding='utf-8') as f:
                 f.write(err)
